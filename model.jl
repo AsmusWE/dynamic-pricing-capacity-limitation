@@ -1,9 +1,7 @@
 using JuMP, Gurobi
 
-function dynamic_pricing(data, node, line, individual, beta, cap, distribution, line_cap)
-    model = Model(Gurobi.Optimizer)
-    set_optimizer_attribute(model, "MIPGap", 1e-4)
-    set_optimizer_attribute(model, "OutputFlag", 0)
+function dynamic_pricing(data, node, line, individual, beta, cap, distribution, line_cap, grb_env)
+    model = Model(() -> Gurobi.Optimizer(grb_env))
     # Sets
     I = 1:length(node)-1
     N = length(node)-1
@@ -133,8 +131,8 @@ function dynamic_pricing(data, node, line, individual, beta, cap, distribution, 
     @constraint(model, price_regularisation[i=I,t=1:T], x[i,t] <= x̅)
     
     #LinDistFlow constraints - cite M.Baran - 
-    @constraint(model, activecommunitybalance[n=0,t=1:T], pⁱᵐ[t] - pᵉˣ[t] == sum(f_p[j,t] for j in node[n].C))
-    @constraint(model, reactivecommunitybalance[n=0,t=1:T], qⁱᵐ[t] - qᵉˣ[t] == sum(f_q[j,t] for j in node[n].C))
+    @constraint(model, activecommunitybalance[n=[0],t=1:T], pⁱᵐ[t] - pᵉˣ[t] == sum(f_p[j,t] for j in node[n].C))
+    @constraint(model, reactivecommunitybalance[n=[0],t=1:T], qⁱᵐ[t] - qᵉˣ[t] == sum(f_q[j,t] for j in node[n].C))
     @constraint(model, activepower[i=I, t=1:T], f_p[i,t] == p⁺[i,t] - p⁻[i,t] + sum(f_p[j,t] for j in node[i].C))
     @constraint(model, reactivepower[i=I, t=1:T], f_q[i,t] == q⁺[i,t] - q⁻[i,t] + sum(f_q[j,t] for j in node[i].C))
     @constraint(model, voltage[n=1:N, t=1:T], u[node[n].A[1],t] - 2*((f_p[n,t]/Sᵇᵃˢᵉ)*line[n].r + (f_q[n,t]/Sᵇᵃˢᵉ)*line[n].x) == u[n,t])

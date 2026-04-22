@@ -73,10 +73,10 @@ mutable struct  Line
    end
 end
 
-function load_data(caseID)
-    gen_data = CSV.read("/Users/benneviscrowley/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/Dokumenter/PhD/Dynamic pricing in energy communities/Code/Data/testcase/$caseID/generators.csv", DataFrame)
-    node_data = CSV.read("/Users/benneviscrowley/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/Dokumenter/PhD/Dynamic pricing in energy communities/Code/Data/testcase/$caseID/nodes.csv", DataFrame)
-    line_data = CSV.read("/Users/benneviscrowley/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/Dokumenter/PhD/Dynamic pricing in energy communities/Code/Data/testcase/$caseID/lines.csv", DataFrame)
+function load_data(data_path, caseID)
+    gen_data = CSV.read(joinpath(data_path, "testcase", caseID, "generators.csv"), DataFrame)
+    node_data = CSV.read(joinpath(data_path, "testcase", caseID, "nodes.csv"), DataFrame)
+    line_data = CSV.read(joinpath(data_path, "testcase", caseID, "lines.csv"), DataFrame)
 
     gen = Dict()
     for i in 1:size(gen_data,1)

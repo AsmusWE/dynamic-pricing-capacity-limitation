@@ -2,7 +2,7 @@ using CSV, DataFrames, Dates, Query, Plots, DataStructures, ProgressBars, Random
 
 include("DP_CC_OPF/scripts/data_manager.jl")
 
-function data_processing(data_path,caseID,N_consumers)
+function data_processing(data_path,caseID,N_consumers,grb_env)
         #Loading generated profiles from CREST
         df = CSV.read(data_path*"Load Profile Generator/CREST profiles.csv", DataFrame,header=4,delim=';',skipto=7)
         x = df |> @filter(_.var"Dwelling index" == 1) |> DataFrame
@@ -60,7 +60,7 @@ function data_processing(data_path,caseID,N_consumers)
         #regularization constant
         Delta = 10e-6
 
-        (node,line,R,D_n,U_n,U_l,D_l,T) = load_data(caseID)
+        (node,line,R,D_n,U_n,U_l,D_l,T) = load_data(data_path, caseID)
 
         S_max = 0.0
         for i in keys(node)
@@ -92,7 +92,7 @@ function data_processing(data_path,caseID,N_consumers)
                 yⁱᵐ     = data["yⁱᵐ"]
                 yᵉˣ     = data["yᵉˣ"]
                 
-                opt = optimizer_with_attributes(Gurobi.Optimizer, MOI.Silent() => true)
+                opt = optimizer_with_attributes(() -> Gurobi.Optimizer(grb_env), MOI.Silent() => true)
                 prosumer_external = Model(opt)
                 @variable(prosumer_external, 0 <= e[1:T] <= E̅)
                 @variable(prosumer_external, 0 <= pᶜʰ[1:T] <= p̅ᶜʰ)
@@ -131,7 +131,7 @@ function cap_setting(total_residual,var,prices)
 
         y =     (maximum(prices) .- prices)./(maximum(prices)-minimum(prices))
 
-        for i in 1:length(lambda)
+        for i in 1:length(prices)
                 y[i] =     (maximum(prices) - prices[i])/(maximum(prices)-minimum(prices))
         end 
         z = y./sum(y)
@@ -164,7 +164,7 @@ function benchmarks(individual_cost,individual_profile,community_profile,cap)
         return community_benchmark, individual_benchmark
 end
 
-function prosumer_uniform_price(data,node,price,prosumer_number)
+function prosumer_uniform_price(data,node,price,prosumer_number,grb_env)
     
         spot    = price
         T       = 24
@@ -177,7 +177,7 @@ function prosumer_uniform_price(data,node,price,prosumer_number)
         yⁱᵐ     = data["yⁱᵐ"]
         yᵉˣ     = data["yᵉˣ"]
     
-        prosumer_external = Model(Gurobi.Optimizer)
+        prosumer_external = Model(() -> Gurobi.Optimizer(grb_env))
         @variable(prosumer_external, 0 <= e[t=1:T] <= E̅)
         @variable(prosumer_external, 0 <= pᶜʰ[t=1:T] <= p̅ᶜʰ)
         @variable(prosumer_external, 0 <= pᵈⁱˢ[t=1:T] <= p̅ᵈⁱˢ)

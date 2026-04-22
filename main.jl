@@ -16,10 +16,16 @@ default(fontfamily = "Computer Modern", dpi = 400, size = (800, 600))
 include("model.jl")
 include("data processing.jl")
 
+# Shared Gurobi environment to avoid repeated license/environment initialization.
+const GRB_ENV = Gurobi.Env(
+Dict{String, Any}(
+"OutputFlag" => 0,
+"MIPGap" => 1e-4,))
+
 ### Pre-processing and importing data ###
 N_consumer = 14 #number of prosumers
 grid = "feeder15" #grid to use
-data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer)
+data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer,GRB_ENV)
 
 println("Data loaded")
 
@@ -46,9 +52,9 @@ for c in caps
         println("-------------")
         println("BETA = ",b,", CAP = ",c)
         #Storing model results in the relevant dictionaries
-        full[b,c]               = dynamic_pricing(data,node,line,individual_benchmark,b,cap,"none",true)
-        full_uniform[b,c]       = dynamic_pricing(data,node,line,individual_benchmark,b,cap,"uniform",true)
-        full_proportional[b,c]  = dynamic_pricing(data,node,line,individual_benchmark,b,cap,"proportional",true)
+        full[b,c]               = dynamic_pricing(data,node,line,individual_benchmark,b,cap,"none",true,GRB_ENV)
+        full_uniform[b,c]       = dynamic_pricing(data,node,line,individual_benchmark,b,cap,"uniform",true,GRB_ENV)
+        full_proportional[b,c]  = dynamic_pricing(data,node,line,individual_benchmark,b,cap,"proportional",true,GRB_ENV)
     end
 end
 
@@ -259,7 +265,7 @@ println("       Plotting complete       ")
 
 N_consumer = 14 #number of prosumers
 grid = "feeder15" #grid to use
-data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer)
+data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer,GRB_ENV)
 
 ### Residual calculation ###
 residual      = sum(eachcol(data["D"] .- data["PV"]))
@@ -270,11 +276,11 @@ community_benchmark, individual_benchmark = benchmarks(ind_cost,ind_profile,tot_
 b = 0.5
 
 #solving with and without line capacities and checking timing ratio
-casestudy14_without_lines = dynamic_pricing(data,node,line,individual_benchmark,b,cap_14,"none",false)
+casestudy14_without_lines = dynamic_pricing(data,node,line,individual_benchmark,b,cap_14,"none",false,GRB_ENV)
 t_14_without = solve_time(casestudy14_without_lines)
 obj_14_without = objective_value(casestudy14_without_lines)
 
-casestudy14_with_lines = dynamic_pricing(data,node,line,individual_benchmark,b,cap_14,"none",true)
+casestudy14_with_lines = dynamic_pricing(data,node,line,individual_benchmark,b,cap_14,"none",true,GRB_ENV)
 t_14_with = solve_time(casestudy14_with_lines)
 obj_14_with = objective_value(casestudy14_with_lines)
 
@@ -300,7 +306,7 @@ end
 
 N_consumer = 28 #number of prosumers
 grid = "feeder29" #grid to use
-data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer)
+data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer,GRB_ENV)
 
 ### Residual calculation ###
 residual      = sum(eachcol(data["D"] .- data["PV"]))
@@ -310,7 +316,7 @@ cap_28 = cap_setting(total_residual,1,data["spot"])
 community_benchmark, individual_benchmark = benchmarks(ind_cost,ind_profile,tot_profile, cap_28)
 
 b = 0.5
-casestudy28 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_28,"none",false)
+casestudy28 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_28,"none",false,GRB_ENV)
 
 t_28 = solve_time(casestudy28)
 
@@ -333,7 +339,7 @@ end
 
 N_consumer = 56 #number of prosumers
 grid = "feeder57" #grid to use
-data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer)
+data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer,GRB_ENV)
 
 ### Residual calculation ###
 residual      = sum(eachcol(data["D"] .- data["PV"]))
@@ -344,7 +350,7 @@ community_benchmark, individual_benchmark = benchmarks(ind_cost,ind_profile,tot_
 
 b = 0.5
 
-casestudy56 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_56,"none",false)
+casestudy56 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_56,"none",false,GRB_ENV)
 t_56 = solve_time(casestudy56)
 
 for t in 1:24
@@ -365,7 +371,7 @@ end
 
 N_consumer = 112 #number of prosumers
 grid = "feeder113" #grid to use
-data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer)
+data, node, line, ind_cost, tot_cost, ind_profile, tot_profile = data_processing(data_path,grid,N_consumer,GRB_ENV)
 
 ### Residual calculation ###
 residual      = sum(eachcol(data["D"] .- data["PV"]))
@@ -376,7 +382,7 @@ community_benchmark, individual_benchmark = benchmarks(ind_cost,ind_profile,tot_
 
 b = 0.5
 
-casestudy112 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_112,"none",false)
+casestudy112 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_112,"none",false,GRB_ENV)
 t_112 = solve_time(casestudy112)
 
 for t in 1:24
