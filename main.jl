@@ -291,8 +291,8 @@ k = 0
 for t in 1:24
     for l in 1:14
         if value.(casestudy14_without_lines[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy14_without_lines[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", i," capacity exceeded in hour", t, "by", value.(casestudy14_without_lines[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy14_without_lines[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            k += 1
+            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy14_without_lines[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy14_without_lines[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+            global k += 1
         end
     end
 end
@@ -324,8 +324,8 @@ k = 0
 for t in 1:24
     for l in 1:N_consumer
         if value.(casestudy28[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy28[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", i," capacity exceeded in hour", t, "by", value.(casestudy28[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy28[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            k += 1
+            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy28[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy28[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+            global k += 1
         end
     end
 end
@@ -353,11 +353,12 @@ b = 0.5
 casestudy56 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_56,"none",false,GRB_ENV)
 t_56 = solve_time(casestudy56)
 
+k = 0
 for t in 1:24
     for l in 1:N_consumer
         if value.(casestudy56[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy56[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", i," capacity exceeded in hour", t, "by", value.(casestudy56[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy56[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            k += 1
+            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy56[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy56[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+            global k += 1
         end
     end
 end
@@ -385,11 +386,12 @@ b = 0.5
 casestudy112 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_112,"none",false,GRB_ENV)
 t_112 = solve_time(casestudy112)
 
+k = 0
 for t in 1:24
     for l in 1:N_consumer
         if value.(casestudy112[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy112[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", i," capacity exceeded in hour", t, "by", value.(casestudy112[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy112[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            k += 1
+            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy112[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy112[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+            global k += 1
         end
     end
 end

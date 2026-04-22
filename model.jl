@@ -225,7 +225,11 @@ function dynamic_pricing(data, node, line, individual, beta, cap, distribution, 
 
     optimize!(model)
     println("--------------------")
-    println(objective_value(model))
+    if has_values(model)
+        println(objective_value(model))
+    else
+        println("No primal solution available. termination_status=$(termination_status(model)), primal_status=$(primal_status(model))")
+    end
     println("--------------------")
     return model
 end 
