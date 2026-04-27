@@ -41,8 +41,11 @@ full_uniform        = Dict()
 full_proportional   = Dict()
 
 #Creating lists with values we want to investigate for cap variation and tariff discount
-betas   = [0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1]
-caps    = [0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1]
+#betas   = [0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1]
+#caps    = [0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1]
+betas = [0, 0.5, 1]
+caps = [0, 0.5, 1]
+
 
 for c in caps
     #cap and benchmark calculation for cap scenario c
@@ -174,9 +177,9 @@ for b in betas
     end
 end
 
-describe(Price[0.6,1])
-describe(Price_Uniform[0.6,1])
-describe(Price_Proportional[0.6,1])
+describe(Price[0.5,1])
+describe(Price_Uniform[0.5,1])
+describe(Price_Proportional[0.5,1])
 
 ################
 ### PLOTTING ###
@@ -287,17 +290,21 @@ obj_14_with = objective_value(casestudy14_with_lines)
 t_ratio = t_14_with/t_14_without
 
 #Line apparent power limit violation check in all hours
-k = 0
-for t in 1:24
-    for l in 1:14
-        if value.(casestudy14_without_lines[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy14_without_lines[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy14_without_lines[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy14_without_lines[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            global k += 1
+if has_values(casestudy14_without_lines)
+    k = 0
+    for t in 1:24
+        for l in 1:14
+            if value.(casestudy14_without_lines[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy14_without_lines[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
+                println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy14_without_lines[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy14_without_lines[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+                global k += 1
+            end
         end
     end
-end
-if k == 0
-    println("No Line Violations")
+    if k == 0
+        println("No Line Violations")
+    end
+else
+    println("Skipping line violation check for 14 prosumers: no primal solution available (termination_status=$(termination_status(casestudy14_without_lines))).")
 end
 
 ###################################
@@ -320,17 +327,21 @@ casestudy28 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_28,"none
 
 t_28 = solve_time(casestudy28)
 
-k = 0
-for t in 1:24
-    for l in 1:N_consumer
-        if value.(casestudy28[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy28[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy28[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy28[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            global k += 1
+if has_values(casestudy28)
+    k = 0
+    for t in 1:24
+        for l in 1:N_consumer
+            if value.(casestudy28[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy28[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
+                println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy28[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy28[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+                global k += 1
+            end
         end
     end
-end
-if k == 0
-    println("No Line Violations")
+    if k == 0
+        println("No Line Violations")
+    end
+else
+    println("Skipping line violation check for 28 prosumers: no primal solution available (termination_status=$(termination_status(casestudy28))).")
 end
 
 ###################################
@@ -353,17 +364,21 @@ b = 0.5
 casestudy56 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_56,"none",false,GRB_ENV)
 t_56 = solve_time(casestudy56)
 
-k = 0
-for t in 1:24
-    for l in 1:N_consumer
-        if value.(casestudy56[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy56[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy56[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy56[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            global k += 1
+if has_values(casestudy56)
+    k = 0
+    for t in 1:24
+        for l in 1:N_consumer
+            if value.(casestudy56[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy56[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
+                println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy56[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy56[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+                global k += 1
+            end
         end
     end
-end
-if k == 0
-    println("No Line Violations")
+    if k == 0
+        println("No Line Violations")
+    end
+else
+    println("Skipping line violation check for 56 prosumers: no primal solution available (termination_status=$(termination_status(casestudy56))).")
 end
 
 ###################################
@@ -386,17 +401,21 @@ b = 0.5
 casestudy112 = dynamic_pricing(data,node,line,individual_benchmark,b,cap_112,"none",false,GRB_ENV)
 t_112 = solve_time(casestudy112)
 
-k = 0
-for t in 1:24
-    for l in 1:N_consumer
-        if value.(casestudy112[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy112[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
-            println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy112[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy112[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
-            global k += 1
+if has_values(casestudy112)
+    k = 0
+    for t in 1:24
+        for l in 1:N_consumer
+            if value.(casestudy112[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy112[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 >= (line[l].f̅)^2
+                println("Line", l," capacity exceeded in hour", t, "by", value.(casestudy112[:f_p][l,t]/data["Sᵇᵃˢᵉ"]).^2 + value.(casestudy112[:f_q][l,t]/data["Sᵇᵃˢᵉ"]).^2 - (line[l].f̅)^2)
+                global k += 1
+            end
         end
     end
-end
-if k == 0
-    println("No Line Violations")
+    if k == 0
+        println("No Line Violations")
+    end
+else
+    println("Skipping line violation check for 112 prosumers: no primal solution available (termination_status=$(termination_status(casestudy112))).")
 end
 
 println("14 lines: ",t_14_without)
@@ -406,26 +425,30 @@ println("112 lines: ",t_112)
 
 
 #Comparative Plots
-plot14 = bar(0.5:23.5,value.(casestudy14_without_lines[:pⁱᵐ]),bar_width=1,xlims=(0,24))
-bar!(0.5:23.5,value.(casestudy28[:pⁱᵐ]),bar_width=1,xlims=(0,24),color =:green)
-plot56 = bar(0.5:23.5,value.(casestudy56[:pⁱᵐ]),bar_width=1,xlims=(0,24))
-plot112 = bar(0.5:23.5,value.(casestudy112[:pⁱᵐ]),bar_width=1,xlims=(0,24))
+if all(has_values.((casestudy14_without_lines, casestudy28, casestudy56, casestudy112)))
+    plot14 = bar(0.5:23.5,value.(casestudy14_without_lines[:pⁱᵐ]),bar_width=1,xlims=(0,24))
+    plot28 = bar(0.5:23.5,value.(casestudy28[:pⁱᵐ]),bar_width=1,xlims=(0,24),color =:green)
+    plot56 = bar(0.5:23.5,value.(casestudy56[:pⁱᵐ]),bar_width=1,xlims=(0,24))
+    plot112 = bar(0.5:23.5,value.(casestudy112[:pⁱᵐ]),bar_width=1,xlims=(0,24))
 
-comparison = plot(plot14,plot28,plot56,plot112, layout = (2,2))
+    comparison = plot(plot14,plot28,plot56,plot112, layout = (2,2))
 
-bar(0.5:23.5,value.(casestudy112[:pⁱᵐ]),bar_width=1,xlims=(0,24),label="112 Members",xlabel = "Time-of-day [h]",xlabelfontsize=12,xtickfontsize=12,ylabel = "Power [kW]", ylabelfontsize=12,ytickfontsize=12,legendfontsize=12)
-bar!(0.5:23.5,value.(casestudy56[:pⁱᵐ]),bar_width=1,xlims=(0,24),color=:turquoise, label="56 Members")
-bar!(0.5:23.5,value.(casestudy28[:pⁱᵐ]),bar_width=1,xlims=(0,24),color=:turquoise1, label="28 Members")
-bar!(0.5:23.5,value.(casestudy14_without_lines[:pⁱᵐ]),bar_width=1,xlims=(0,24),color=:green, label="14 Members")
-plot!(0:23,cap_14,color =:black,linetype=:steppost,linewidth=3,label=false)
-plot!(23:24,[cap_14[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
-plot!(0:23,cap_28,color =:black,linetype=:steppost,linewidth=3,label=false)
-plot!(23:24,[cap_28[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
-plot!(0:23,cap_56,color =:black,linetype=:steppost,linewidth=3,label=false)
-plot!(23:24,[cap_56[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
-plot!(0:23,cap_112,color =:black,linetype=:steppost,linewidth=3,label=false)
-plot!(23:24,[cap_112[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
-savefig("Figures/scaling_comparison.pdf")
+    bar(0.5:23.5,value.(casestudy112[:pⁱᵐ]),bar_width=1,xlims=(0,24),label="112 Members",xlabel = "Time-of-day [h]",xlabelfontsize=12,xtickfontsize=12,ylabel = "Power [kW]", ylabelfontsize=12,ytickfontsize=12,legendfontsize=12)
+    bar!(0.5:23.5,value.(casestudy56[:pⁱᵐ]),bar_width=1,xlims=(0,24),color=:turquoise, label="56 Members")
+    bar!(0.5:23.5,value.(casestudy28[:pⁱᵐ]),bar_width=1,xlims=(0,24),color=:turquoise1, label="28 Members")
+    bar!(0.5:23.5,value.(casestudy14_without_lines[:pⁱᵐ]),bar_width=1,xlims=(0,24),color=:green, label="14 Members")
+    plot!(0:23,cap_14,color =:black,linetype=:steppost,linewidth=3,label=false)
+    plot!(23:24,[cap_14[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
+    plot!(0:23,cap_28,color =:black,linetype=:steppost,linewidth=3,label=false)
+    plot!(23:24,[cap_28[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
+    plot!(0:23,cap_56,color =:black,linetype=:steppost,linewidth=3,label=false)
+    plot!(23:24,[cap_56[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
+    plot!(0:23,cap_112,color =:black,linetype=:steppost,linewidth=3,label=false)
+    plot!(23:24,[cap_112[end],cap_14[end]],color =:black,linetype=:steppost,linewidth=3,label=false)
+    savefig("Figures/scaling_comparison.pdf")
+else
+    println("Skipping scaling comparison plot because at least one case has no primal solution.")
+end
 
 
 
