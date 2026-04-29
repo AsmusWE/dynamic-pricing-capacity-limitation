@@ -33,18 +33,17 @@ def normalize_price_matrix(x, T=24):
 
 
 def build_payload(env, action, current_soc):
-    t = int(env.t)
     return {
         "prices": np.nan_to_num(np.asarray(action, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
-        "D": np.nan_to_num(np.asarray(env.data["D"])[:, t], nan=0.0, posinf=0.0, neginf=0.0).tolist(),
-        "PV": np.nan_to_num(np.asarray(env.data["PV"])[:, t], nan=0.0, posinf=0.0, neginf=0.0).tolist(),
+        "D": np.nan_to_num(np.asarray(env.data["D"], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
+        "PV": np.nan_to_num(np.asarray(env.data["PV"], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
         "soc": np.nan_to_num(np.asarray(current_soc, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
         "eta": float(env.data["eta"]),
         "E_max": np.nan_to_num(np.asarray(env.data["E_max"], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
         "p_ch_max": np.nan_to_num(np.asarray(env.data["p_ch_max"], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
         "p_dis_max": np.nan_to_num(np.asarray(env.data["p_dis_max"], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
-        "y_im": float(np.asarray(env.data["y_im"])[t]),
-        "y_ex": float(np.asarray(env.data["y_ex"])[t]),
+        "y_im": np.nan_to_num(np.asarray(env.data["y_im"], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
+        "y_ex": np.nan_to_num(np.asarray(env.data["y_ex"], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).tolist(),
     }
 
 
@@ -69,27 +68,21 @@ def test_julia_and_python_consumer_step_match():
     prices = normalize_price_matrix(solution["x"], T=24)
 
     sys.path.insert(0, REPO_ROOT)
-    from MARL_environment import make_env
+    from marl_environment import make_env
     from consumer_step import solve_consumer_step
 
     env = make_env(None, n_prosumers=14, T=24)
     env.reset()
 
-    current_soc = np.zeros(14, dtype=np.float32)
-    for hour in range(24):
-        action = prices[:, hour]
-        payload = build_payload(env, action, current_soc)
+    payload = build_payload(env, prices, env.soc)
 
-        julia_result = run_julia_consumer_step(payload)
-        python_result = solve_consumer_step(payload)
+    julia_result = run_julia_consumer_step(payload)
+    python_result = solve_consumer_step(payload)
 
-        for key in julia_result.keys():
-            expected = np.squeeze(np.asarray(julia_result[key], dtype=np.float64))
-            actual = np.squeeze(np.asarray(python_result[key], dtype=np.float64))
-            assert np.allclose(expected, actual, atol=1e-6), f"Mismatch for {key} at hour {hour}: {expected} vs {actual}"
-
-        current_soc = np.asarray(julia_result["next_soc"], dtype=np.float32)
-        env.t += 1
+    for key in julia_result.keys():
+        expected = np.asarray(julia_result[key], dtype=np.float64)
+        actual = np.asarray(python_result[key], dtype=np.float64)
+        assert np.allclose(expected, actual, atol=1e-6), f"Mismatch for {key}: {expected} vs {actual}"
 
 
 if __name__ == "__main__":
