@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import json
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -10,366 +10,362 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from gymnasium import spaces
 from torch import nn
 
-from marl_environment import make_env
+from marl_environment import MARLEnvironment
 
 
-def flatten_obs(obs: dict[str, np.ndarray]) -> np.ndarray:
-	# Keep a deterministic order for policy input.
-	return np.concatenate(
-		[
-			np.asarray(obs["spot"], dtype=np.float32).reshape(-1),
-			np.asarray(obs["PV"], dtype=np.float32).reshape(-1),
-			np.asarray(obs["D"], dtype=np.float32).reshape(-1),
-			np.asarray(obs["soc"], dtype=np.float32).reshape(-1),
-			np.asarray(obs["hour"], dtype=np.float32).reshape(-1),
-		]
-	).astype(np.float32)
-
-
-class SingleAgentAdapter:
-	def __init__(self, solution_path: str | None, n_prosumers: int = 14, horizon: int = 24, seed: int = 1234):
-		self.env = make_env(solution_path, n_prosumers=n_prosumers, T=horizon, seed=seed)
-		self.agent = self.env.agents[0]
-		action_space = cast(spaces.Box, self.env.action_spaces[self.agent])
-		self.action_shape = tuple(action_space.shape)
-		self.action_low = action_space.low.astype(np.float32).reshape(-1)
-		self.action_high = action_space.high.astype(np.float32).reshape(-1)
-		self.action_dim = int(self.action_low.size)
-		self.obs_dim = int(flatten_obs(self._peek_obs()).shape[0])
-
-	def _peek_obs(self) -> dict[str, np.ndarray]:
-		self.env.reset()
-		return self.env.observe(self.agent)
-
-	def reset(self) -> np.ndarray:
-		self.env.reset()
-		return flatten_obs(self.env.observe(self.agent))
-
-	def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
-		clipped = np.clip(np.asarray(action, dtype=np.float32).reshape(-1), self.action_low, self.action_high).astype(np.float32)
-		self.env.agent_selection = self.agent
-		self.env.step(clipped.reshape(self.action_shape).tolist())
-		reward = float(self.env.rewards[self.agent])
-		done = bool(self.env.dones[self.agent])
-		info = dict(self.env.infos[self.agent])
-		if done:
-			next_obs = np.zeros(self.obs_dim, dtype=np.float32)
-		else:
-			next_obs = flatten_obs(self.env.observe(self.agent))
-		return next_obs, reward, done, info
+# ---------------------------------------------------------------------------
+# Replay buffer
+# ---------------------------------------------------------------------------
 
 
 class ReplayBuffer:
-	def __init__(self, capacity: int, obs_dim: int, action_dim: int):
-		self.capacity = int(capacity)
-		self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
-		self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
-		self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
-		self.rewards = np.zeros((capacity, 1), dtype=np.float32)
-		self.dones = np.zeros((capacity, 1), dtype=np.float32)
-		self.ptr = 0
-		self.size = 0
+    def __init__(self, capacity: int, obs_dim: int, action_dim: int):
+        self.capacity = int(capacity)
+        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
+        self.dones = np.zeros((capacity, 1), dtype=np.float32)
+        self.ptr = 0
+        self.size = 0
 
-	def add(self, obs: np.ndarray, action: np.ndarray, reward: float, next_obs: np.ndarray, done: bool) -> None:
-		i = self.ptr
-		self.obs[i] = obs
-		self.actions[i] = action
-		self.rewards[i] = reward
-		self.next_obs[i] = next_obs
-		self.dones[i] = float(done)
-		self.ptr = (self.ptr + 1) % self.capacity
-		self.size = min(self.size + 1, self.capacity)
+    def add(self, obs: np.ndarray, action: np.ndarray, reward: float, next_obs: np.ndarray, done: bool) -> None:
+        i = self.ptr
+        self.obs[i] = obs
+        self.actions[i] = action
+        self.rewards[i] = reward
+        self.next_obs[i] = next_obs
+        self.dones[i] = float(done)
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
-	def sample(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-		idx = np.random.randint(0, self.size, size=batch_size)
-		return (
-			torch.as_tensor(self.obs[idx], device=device),
-			torch.as_tensor(self.actions[idx], device=device),
-			torch.as_tensor(self.rewards[idx], device=device),
-			torch.as_tensor(self.next_obs[idx], device=device),
-			torch.as_tensor(self.dones[idx], device=device),
-		)
+    def sample(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+        idx = np.random.randint(0, self.size, size=batch_size)
+        return (
+            torch.as_tensor(self.obs[idx], device=device),
+            torch.as_tensor(self.actions[idx], device=device),
+            torch.as_tensor(self.rewards[idx], device=device),
+            torch.as_tensor(self.next_obs[idx], device=device),
+            torch.as_tensor(self.dones[idx], device=device),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
 
 
 class MLP(nn.Module):
-	def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 256):
-		super().__init__()
-		self.net = nn.Sequential(
-			nn.Linear(in_dim, hidden_dim),
-			nn.ReLU(),
-			nn.Linear(hidden_dim, hidden_dim),
-			nn.ReLU(),
-			nn.Linear(hidden_dim, out_dim),
-		)
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class Critic(nn.Module):
-	def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256):
-		super().__init__()
-		self.q1 = MLP(obs_dim + action_dim, 1, hidden_dim)
-		self.q2 = MLP(obs_dim + action_dim, 1, hidden_dim)
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.q1 = MLP(obs_dim + action_dim, 1, hidden_dim)
+        self.q2 = MLP(obs_dim + action_dim, 1, hidden_dim)
 
-	def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		x = torch.cat([obs, action], dim=-1)
-		return self.q1(x), self.q2(x)
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([obs, action], dim=-1)
+        return self.q1(x), self.q2(x)
 
 
 class Actor(nn.Module):
-	def __init__(self, obs_dim: int, action_dim: int, action_low: np.ndarray, action_high: np.ndarray, hidden_dim: int = 256):
-		super().__init__()
-		self.backbone = MLP(obs_dim, hidden_dim, hidden_dim)
-		self.mu = nn.Linear(hidden_dim, action_dim)
-		self.log_std = nn.Linear(hidden_dim, action_dim)
+    def __init__(self, obs_dim: int, action_dim: int, action_low: np.ndarray, action_high: np.ndarray, hidden_dim: int = 256):
+        super().__init__()
+        self.backbone = MLP(obs_dim, hidden_dim, hidden_dim)
+        self.mu = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
 
-		scale = (action_high - action_low) / 2.0
-		bias = (action_high + action_low) / 2.0
-		self.register_buffer("action_scale", torch.as_tensor(scale, dtype=torch.float32))
-		self.register_buffer("action_bias", torch.as_tensor(bias, dtype=torch.float32))
+        scale = (action_high - action_low) / 2.0
+        bias = (action_high + action_low) / 2.0
+        self.register_buffer("action_scale", torch.as_tensor(scale, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.as_tensor(bias, dtype=torch.float32))
 
-	def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		h = self.backbone(obs)
-		mu = self.mu(h)
-		log_std = self.log_std(h).clamp(-5.0, 2.0)
-		return mu, log_std
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.backbone(obs)
+        mu = self.mu(h)
+        log_std = self.log_std(h).clamp(-5.0, 2.0)
+        return mu, log_std
 
-	def sample(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-		mu, log_std = self(obs)
-		std = log_std.exp()
-		dist = torch.distributions.Normal(mu, std)
-		pre_tanh = dist.rsample()
-		tanh_action = torch.tanh(pre_tanh)
-		action_scale = cast(torch.Tensor, self.action_scale)
-		action_bias = cast(torch.Tensor, self.action_bias)
-		action = tanh_action * action_scale + action_bias
+    def sample(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, log_std = self(obs)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mu, std)
+        pre_tanh = dist.rsample()
+        tanh_action = torch.tanh(pre_tanh)
+        action_scale = cast(torch.Tensor, self.action_scale)
+        action_bias = cast(torch.Tensor, self.action_bias)
+        action = tanh_action * action_scale + action_bias
 
-		# Tanh correction term for reparameterized policy log-prob.
-		log_prob = dist.log_prob(pre_tanh) - torch.log(1.0 - tanh_action.pow(2) + 1e-6)
-		log_prob = log_prob.sum(dim=-1, keepdim=True)
+        # Tanh correction for the reparameterized log-prob.
+        log_prob = dist.log_prob(pre_tanh) - torch.log(1.0 - tanh_action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
 
-		deterministic = torch.tanh(mu) * action_scale + action_bias
-		return action, log_prob, deterministic
+        deterministic = torch.tanh(mu) * action_scale + action_bias
+        return action, log_prob, deterministic
+
+
+# ---------------------------------------------------------------------------
+# SAC configuration
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class SACConfig:
-	episodes: int = 200
-	horizon: int = 24
-	gamma: float = 0.99
-	tau: float = 0.005
-	actor_lr: float = 3e-4
-	critic_lr: float = 3e-4
-	alpha_lr: float = 1e-4
-	batch_size: int = 16
-	buffer_size: int = 100_000
-	warmup_steps: int = 0
-	updates_per_step: int = 1
-	hidden_dim: int = 256
-	seed: int = 42
+    n_prosumers: int = 14
+    episodes: int = 200
+    horizon: int = 24
+    capacity_bonus: float = 5.0
+    data_dir: str = "Data"
+    gamma: float = 0.99
+    tau: float = 0.005
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    alpha_lr: float = 1e-4
+    batch_size: int = 256
+    buffer_size: int = 100_000
+    warmup_steps: int = 500
+    updates_per_step: int = 1
+    hidden_dim: int = 256
+    seed: int = 42
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 
 def set_seed(seed: int) -> None:
-	np.random.seed(seed)
-	torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
-	with torch.no_grad():
-		for t, s in zip(target.parameters(), source.parameters()):
-			t.data.mul_(1.0 - tau).add_(tau * s.data)
+    with torch.no_grad():
+        for t, s in zip(target.parameters(), source.parameters()):
+            t.data.mul_(1.0 - tau).add_(tau * s.data)
 
 
-def _scalar_at_t(values: object, t: int, horizon: int) -> float:
-	arr = np.asarray(values, dtype=np.float64)
-	if arr.ndim == 0:
-		return float(arr)
-	if arr.ndim == 1:
-		idx = min(t, arr.shape[0] - 1)
-		return float(arr[idx])
-	if arr.shape[-1] == horizon:
-		return float(np.take(arr, t, axis=-1).sum())
-	if arr.shape[0] == horizon:
-		return float(arr[t].sum())
-	return float(arr.sum())
+def _update_agent(
+    actor: Actor,
+    critic: Critic,
+    target_critic: Critic,
+    buffer: ReplayBuffer,
+    log_alpha: torch.Tensor,
+    actor_optim: torch.optim.Optimizer,
+    critic_optim: torch.optim.Optimizer,
+    alpha_optim: torch.optim.Optimizer,
+    config: SACConfig,
+    target_entropy: float,
+    device: torch.device,
+) -> None:
+    o, a, r, no, d = buffer.sample(config.batch_size, device)
+
+    with torch.no_grad():
+        next_a, next_logp, _ = actor.sample(no)
+        tq1, tq2 = target_critic(no, next_a)
+        alpha = log_alpha.exp().detach()
+        target_v = torch.min(tq1, tq2) - alpha * next_logp
+        target_q = r + (1.0 - d) * config.gamma * target_v
+
+    q1, q2 = critic(o, a)
+    critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+    critic_optim.zero_grad()
+    critic_loss.backward()
+    critic_optim.step()
+
+    new_a, logp, _ = actor.sample(o)
+    q1_pi, q2_pi = critic(o, new_a)
+    q_pi = torch.min(q1_pi, q2_pi)
+    actor_loss = (log_alpha.exp().detach() * logp - q_pi).mean()
+    actor_optim.zero_grad()
+    actor_loss.backward()
+    actor_optim.step()
+
+    alpha_loss = -(log_alpha * (logp + target_entropy).detach()).mean()
+    alpha_optim.zero_grad()
+    alpha_loss.backward()
+    alpha_optim.step()
+
+    with torch.no_grad():
+        log_alpha.clamp_(-10.0, 2.0)
+
+    _soft_update(target_critic, critic, config.tau)
 
 
-def load_optimal_reward(solution_path: Path, horizon: int) -> float:
-	if not solution_path.exists():
-		return float("nan")
-	with solution_path.open("r", encoding="utf-8") as f:
-		sol = json.load(f)
-
-	if "objective" in sol:
-		return -float(sol["objective"])
-
-	# Fallback reconstruction if objective is not stored.
-	total_cost = 0.0
-	for t in range(horizon):
-		spot = _scalar_at_t(sol.get("spot", 0.0), t, horizon)
-		y_im = _scalar_at_t(sol.get("y_im", 0.0), t, horizon)
-		y_ex = _scalar_at_t(sol.get("y_ex", 0.0), t, horizon)
-		alpha_grid = _scalar_at_t(sol.get("alpha_grid", 75.0), t, horizon)
-		beta = _scalar_at_t(sol.get("beta", 0.5), t, horizon)
-
-		p_im = _scalar_at_t(sol.get("p_im", 0.0), t, horizon)
-		p_ex = _scalar_at_t(sol.get("p_ex", 0.0), t, horizon)
-		p_pen = _scalar_at_t(sol.get("p_pen", 0.0), t, horizon)
-		p_plus = _scalar_at_t(sol.get("p_plus", 0.0), t, horizon)
-		d_shed = _scalar_at_t(sol.get("d_shed", 0.0), t, horizon)
-
-		market_cost = p_im * (spot + y_im) - p_ex * (spot - y_ex)
-		internal_transfer_cost = (1.0 - beta) * y_im * (p_plus - p_im)
-		capacity_cost = alpha_grid * p_pen
-		load_shedding_cost = 1.25 * alpha_grid * d_shed
-		total_cost += market_cost + internal_transfer_cost + capacity_cost + load_shedding_cost
-
-	return -float(total_cost)
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
 
-def train_sac(config: SACConfig) -> tuple[list[float], float]:
-	set_seed(config.seed)
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train_independent_sac(config: SACConfig) -> list[float]:
+    """Train N independent SAC agents, one per prosumer."""
+    set_seed(config.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-	env = SingleAgentAdapter(solution_path=None, n_prosumers=14, horizon=config.horizon, seed=config.seed)
-	obs_dim = env.obs_dim
-	action_dim = env.action_dim
+    env = MARLEnvironment(
+        n_prosumers=config.n_prosumers,
+        T=config.horizon,
+        data_dir=config.data_dir,
+        capacity_bonus=config.capacity_bonus,
+    )
+    n = env._n
+    obs_dim = 6 * config.horizon + 2  # 146 for T=24
+    action_dim = 1
+    action_low = np.array([-1.0], dtype=np.float32)
+    action_high = np.array([1.0], dtype=np.float32)
+    target_entropy = -float(action_dim)
 
-	actor = Actor(obs_dim, action_dim, env.action_low, env.action_high, config.hidden_dim).to(device)
-	critic = Critic(obs_dim, action_dim, config.hidden_dim).to(device)
-	target_critic = Critic(obs_dim, action_dim, config.hidden_dim).to(device)
-	target_critic.load_state_dict(critic.state_dict())
+    actors = [
+        Actor(obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
+        for _ in range(n)
+    ]
+    critics = [Critic(obs_dim, action_dim, config.hidden_dim).to(device) for _ in range(n)]
+    target_critics = [copy.deepcopy(critics[i]) for i in range(n)]
 
-	actor_optim = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
-	critic_optim = torch.optim.Adam(critic.parameters(), lr=config.critic_lr)
+    log_alphas = [torch.tensor(0.0, device=device, requires_grad=True) for _ in range(n)]
+    actor_optims = [torch.optim.Adam(actors[i].parameters(), lr=config.actor_lr) for i in range(n)]
+    critic_optims = [torch.optim.Adam(critics[i].parameters(), lr=config.critic_lr) for i in range(n)]
+    alpha_optims = [torch.optim.Adam([log_alphas[i]], lr=config.alpha_lr) for i in range(n)]
 
-	log_alpha = torch.tensor(0.0, device=device, requires_grad=True)
-	alpha_optim = torch.optim.Adam([log_alpha], lr=config.alpha_lr)
-	target_entropy = -float(action_dim)
+    buffers = [ReplayBuffer(config.buffer_size, obs_dim, action_dim) for _ in range(n)]
 
-	rb = ReplayBuffer(config.buffer_size, obs_dim, action_dim)
-	episode_returns: list[float] = []
-	global_step = 0
+    total_steps = 0
+    episode_returns: list[float] = []
 
-	for episode in range(config.episodes):
-		obs = env.reset()
+    for episode in range(config.episodes):
+        obs_dict, _ = env.reset()
+        obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
+        ep_return = 0.0
 
-		if global_step < config.warmup_steps:
-			action = np.random.uniform(env.action_low, env.action_high).astype(np.float32)
-		else:
-			obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-			with torch.no_grad():
-				action_t, _, _ = actor.sample(obs_t)
-			action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
+        while env.agents:
+            # Collect actions for all agents
+            actions_dict: dict[str, np.ndarray] = {}
+            for i in range(n):
+                if total_steps < config.warmup_steps:
+                    a = env.action_space(f"consumer_{i}").sample()
+                else:
+                    obs_t = torch.as_tensor(obs[i], dtype=torch.float32, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        a_t, _, _ = actors[i].sample(obs_t)
+                    a = a_t.squeeze(0).cpu().numpy().astype(np.float32)
+                actions_dict[f"consumer_{i}"] = a
 
-		next_obs, reward, done, info = env.step(action)
-		rb.add(obs, action, reward, next_obs, done)
-		ep_return = reward
-		global_step += 1
+            next_obs_dict, rewards, terms, truncs, infos = env.step(actions_dict)
+            done = any(terms.values())
+            next_obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
 
-		if rb.size >= config.batch_size:
-			for _ in range(config.updates_per_step):
-				o, a, r, no, d = rb.sample(config.batch_size, device)
+            for i in range(n):
+                buffers[i].add(
+                    obs[i],
+                    actions_dict[f"consumer_{i}"],
+                    rewards[f"consumer_{i}"],
+                    next_obs[i],
+                    float(done),
+                )
+                ep_return += rewards[f"consumer_{i}"]
 
-				with torch.no_grad():
-					next_a, next_logp, _ = actor.sample(no)
-					tq1, tq2 = target_critic(no, next_a)
-					alpha = log_alpha.exp().detach()
-					target_v = torch.min(tq1, tq2) - alpha * next_logp
-					target_q = r + (1.0 - d) * config.gamma * target_v
+            obs = next_obs
+            total_steps += 1
 
-				q1, q2 = critic(o, a)
-				critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+            # Independent SAC update per agent
+            if total_steps > config.warmup_steps and buffers[0].size >= config.batch_size:
+                for _ in range(config.updates_per_step):
+                    for i in range(n):
+                        _update_agent(
+                            actors[i], critics[i], target_critics[i],
+                            buffers[i], log_alphas[i],
+                            actor_optims[i], critic_optims[i], alpha_optims[i],
+                            config, target_entropy, device,
+                        )
 
-				critic_optim.zero_grad()
-				critic_loss.backward()
-				critic_optim.step()
+        avg_return = ep_return / (n * config.horizon)
+        episode_returns.append(avg_return)
+        print(f"Episode {episode + 1:4d}/{config.episodes}: avg_return={avg_return:10.4f}  steps={total_steps}")
 
-				new_a, logp, _ = actor.sample(o)
-				q1_pi, q2_pi = critic(o, new_a)
-				q_pi = torch.min(q1_pi, q2_pi)
-				actor_loss = (log_alpha.exp().detach() * logp - q_pi).mean()
-
-				actor_optim.zero_grad()
-				actor_loss.backward()
-				actor_optim.step()
-
-				alpha_loss = -(log_alpha * (logp + target_entropy).detach()).mean()
-				alpha_optim.zero_grad()
-				alpha_loss.backward()
-				alpha_optim.step()
-
-				with torch.no_grad():
-					log_alpha.clamp_(-10.0, 2.0)
-
-				_soft_update(target_critic, critic, config.tau)
-
-		mean_action = float(np.mean(action))
-		std_action = float(np.std(action))
-		episode_returns.append(ep_return)
-		print(f"Episode {episode + 1:4d}/{config.episodes}: return={ep_return:10.4f} | mean_action={mean_action:.6f} std={std_action:.6f}")
-
-	optimal = load_optimal_reward(Path("outputs") / "opt_solution.json", config.horizon)
-	return episode_returns, optimal
+    return episode_returns
 
 
-def plot_returns(episode_returns: list[float], optimal_reward: float, out_path: Path) -> None:
-	out_path.parent.mkdir(parents=True, exist_ok=True)
-	x = np.arange(1, len(episode_returns) + 1)
-	y = np.asarray(episode_returns, dtype=np.float64)
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
 
-	plt.figure(figsize=(10, 5))
-	plt.plot(x, y, label="SAC episodic reward", linewidth=1.5)
 
-	if len(y) >= 10:
-		win = min(20, len(y))
-		ma = np.convolve(y, np.ones(win) / win, mode="valid")
-		plt.plot(np.arange(win, len(y) + 1), ma, label=f"Moving average ({win})", linewidth=2.0)
+def plot_returns(episode_returns: list[float], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    x = np.arange(1, len(episode_returns) + 1)
+    y = np.asarray(episode_returns, dtype=np.float64)
 
-	if np.isfinite(optimal_reward):
-		plt.axhline(optimal_reward, color="tab:red", linestyle="--", label="Optimal reward baseline")
+    plt.figure(figsize=(10, 5))
+    plt.plot(x, y, label="Avg per-agent per-step return", linewidth=1.5)
 
-	plt.xlabel("Episode")
-	plt.ylabel("Episode return")
-	plt.title("SAC Training: Episodic Reward vs Optimal Baseline")
-	plt.grid(alpha=0.25)
-	plt.legend()
-	plt.tight_layout()
-	plt.savefig(out_path, dpi=150)
-	plt.close()
+    if len(y) >= 10:
+        win = min(20, len(y))
+        ma = np.convolve(y, np.ones(win) / win, mode="valid")
+        plt.plot(np.arange(win, len(y) + 1), ma, label=f"Moving average ({win})", linewidth=2.0)
+
+    plt.xlabel("Episode")
+    plt.ylabel("Average return (DKK per agent per step)")
+    plt.title("Independent SAC: Per-Agent Average Return")
+    plt.grid(alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(description="Single-agent SAC for dynamic pricing environment")
-	parser.add_argument("--episodes", type=int, default=1_000)
-	parser.add_argument("--horizon", type=int, default=24)
-	parser.add_argument("--seed", type=int, default=42)
-	parser.add_argument("--warmup-steps", type=int, default=1_000)
-	parser.add_argument("--batch-size", type=int, default=16)
-	parser.add_argument("--buffer-size", type=int, default=100_000)
-	parser.add_argument("--updates-per-step", type=int, default=1)
-	parser.add_argument("--plot-path", type=str, default="Figures/sac_vs_optimal_reward.png")
-	args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Independent SAC for decentralized energy-community MARL")
+    parser.add_argument("--n-prosumers", type=int, default=14)
+    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--horizon", type=int, default=24)
+    parser.add_argument("--capacity-bonus", type=float, default=5.0)
+    parser.add_argument("--data-dir", type=str, default="Data")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--buffer-size", type=int, default=100_000)
+    parser.add_argument("--updates-per-step", type=int, default=1)
+    parser.add_argument("--plot-path", type=str, default="Figures/independent_sac_returns.png")
+    args = parser.parse_args()
 
-	config = SACConfig(
-		episodes=args.episodes,
-		horizon=args.horizon,
-		seed=args.seed,
-		warmup_steps=args.warmup_steps,
-		batch_size=args.batch_size,
-		buffer_size=args.buffer_size,
-		updates_per_step=args.updates_per_step,
-	)
+    config = SACConfig(
+        n_prosumers=args.n_prosumers,
+        episodes=args.episodes,
+        horizon=args.horizon,
+        capacity_bonus=args.capacity_bonus,
+        data_dir=args.data_dir,
+        seed=args.seed,
+        warmup_steps=args.warmup_steps,
+        batch_size=args.batch_size,
+        buffer_size=args.buffer_size,
+        updates_per_step=args.updates_per_step,
+    )
 
-	episode_returns, optimal = train_sac(config)
-	plot_path = Path(args.plot_path)
-	plot_returns(episode_returns, optimal, plot_path)
-	print(f"Saved reward plot to: {plot_path}")
+    episode_returns = train_independent_sac(config)
+    plot_path = Path(args.plot_path)
+    plot_returns(episode_returns, plot_path)
+    print(f"Saved return plot to: {plot_path}")
 
 
 if __name__ == "__main__":
-	main()
+    main()
