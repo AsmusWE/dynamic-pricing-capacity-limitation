@@ -52,6 +52,15 @@ class ReplayBuffer:
         )
 
 
+@dataclass
+class BenchmarkRollout:
+    episode: int
+    policy_reward: float
+    policy_import: np.ndarray
+    lp_reward: float | None
+    lp_import: np.ndarray | None
+
+
 # ---------------------------------------------------------------------------
 # Networks
 # ---------------------------------------------------------------------------
@@ -133,9 +142,9 @@ class SACConfig:
     data_dir: str = "Data"
     gamma: float = 0.99
     tau: float = 0.005
-    actor_lr: float = 3e-4
-    critic_lr: float = 3e-4
-    alpha_lr: float = 1e-4
+    actor_lr: float = 1e-3
+    critic_lr: float = 1e-3
+    alpha_lr: float = 1e-3
     batch_size: int = 256
     buffer_size: int = 100_000
     warmup_steps: int = 500
@@ -247,8 +256,8 @@ def _run_reference_episode(
     *,
     deterministic: bool,
     lp_actions: np.ndarray | None = None,
-) -> float:
-    """Run one episode on the reference scenario and return total reward.
+) -> tuple[float, np.ndarray]:
+    """Run one episode on the reference scenario and return total reward and hourly import.
 
     If deterministic=True, uses the actor mean (no exploration).
     If lp_actions is provided, uses those instead of the policy.
@@ -256,6 +265,7 @@ def _run_reference_episode(
     obs_dict, _ = env.reset(options={"reference": True})
     obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
     total_reward = 0.0
+    hourly_import: list[float] = []
     t = 0
     while env.agents:
         actions_dict: dict[str, np.ndarray] = {}
@@ -271,11 +281,12 @@ def _run_reference_episode(
                 else:
                     a = det_a.squeeze(0).cpu().numpy().astype(np.float32)
             actions_dict[f"consumer_{i}"] = a
-        next_obs_dict, rewards, _, _, _ = env.step(actions_dict)
+        next_obs_dict, rewards, _, _, infos = env.step(actions_dict)
         total_reward += sum(rewards.values())
+        hourly_import.append(float(sum(info["p_plus"] for info in infos.values())))
         obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
         t += 1
-    return total_reward
+    return total_reward, np.asarray(hourly_import, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +294,7 @@ def _run_reference_episode(
 # ---------------------------------------------------------------------------
 
 
-def train_independent_sac(config: SACConfig) -> tuple[list[float], list[tuple[int, float, float | None]]]:
+def train_independent_sac(config: SACConfig) -> tuple[list[float], list[BenchmarkRollout]]:
     """Train N independent SAC agents, one per prosumer."""
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -302,7 +313,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[tuple[in
     action_dim = 1
     action_low = np.array([-1.0], dtype=np.float32)
     action_high = np.array([1.0], dtype=np.float32)
-    target_entropy = -float(action_dim)
+    target_entropy = -float(action_dim)*10
 
     actors = [
         Actor(obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
@@ -321,15 +332,16 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[tuple[in
     # Load LP baseline (optional — requires running extract_optimal_actions.jl first)
     lp_actions = _load_lp_actions(config.data_dir)
     lp_baseline: float | None = None
+    lp_reference_import: np.ndarray | None = None
     if lp_actions is not None:
-        lp_baseline = _run_reference_episode(
+        lp_baseline, lp_reference_import = _run_reference_episode(
             env, actors, n, device, deterministic=True, lp_actions=lp_actions
         )
         print(f"LP baseline reward (reference day): {lp_baseline:.4f}")
 
     total_steps = 0
     episode_returns: list[float] = []
-    benchmark_history: list[tuple[int, float, float | None]] = []
+    benchmark_history: list[BenchmarkRollout] = []
 
     for episode in range(config.episodes):
         obs_dict, _ = env.reset()
@@ -379,13 +391,25 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[tuple[in
 
         avg_return = ep_return / (n * config.horizon)
         episode_returns.append(avg_return)
-        print(f"Episode {episode + 1:4d}/{config.episodes}: avg_return={avg_return:10.4f}  steps={total_steps}")
+        alpha_value = float(torch.stack([log_alpha.exp().detach() for log_alpha in log_alphas]).mean().cpu())
+        print(
+            f"Episode {episode + 1:4d}/{config.episodes}: "
+            f"avg_return={avg_return:10.4f}  alpha={alpha_value:8.4f}  steps={total_steps}"
+        )
 
         if (episode + 1) % config.benchmark_interval == 0:
-            policy_reward = _run_reference_episode(
+            policy_reward, policy_import = _run_reference_episode(
                 env, actors, n, device, deterministic=True
             )
-            benchmark_history.append((episode + 1, policy_reward, lp_baseline))
+            benchmark_history.append(
+                BenchmarkRollout(
+                    episode=episode + 1,
+                    policy_reward=policy_reward,
+                    policy_import=policy_import,
+                    lp_reward=lp_baseline,
+                    lp_import=lp_reference_import,
+                )
+            )
             if lp_baseline is not None:
                 print(
                     f"  [Benchmark ep {episode + 1}] "
@@ -408,7 +432,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[tuple[in
 def plot_returns(
     episode_returns: list[float],
     out_path: Path,
-    benchmark_history: list[tuple[int, float, float | None]] | None = None,
+    benchmark_history: list[BenchmarkRollout] | None = None,
     lp_baseline: float | None = None,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -433,8 +457,8 @@ def plot_returns(
 
     if has_benchmark:
         ax_bm = axes[1, 0]
-        bm_episodes = [h[0] for h in benchmark_history]
-        bm_rewards = [h[1] for h in benchmark_history]
+        bm_episodes = [h.episode for h in benchmark_history]
+        bm_rewards = [h.policy_reward for h in benchmark_history]
 
         if lp_baseline is not None:
             bm_values = bm_rewards
@@ -455,6 +479,52 @@ def plot_returns(
     plt.close(fig)
 
 
+def plot_benchmark_actions(
+    benchmark_history: list[BenchmarkRollout],
+    out_path: Path,
+    capacity_line: np.ndarray | None = None,
+) -> None:
+    if not benchmark_history:
+        return
+
+    n_panels = len(benchmark_history) + 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4), squeeze=False)
+    x = np.arange(1, len(benchmark_history[0].policy_import) + 1)
+
+    for idx, record in enumerate(benchmark_history):
+        ax = axes[0, idx]
+        ax.bar(x, record.policy_import, width=0.9, color="#2E86AB", label=f"Policy ep {record.episode}")
+        if record.lp_import is not None:
+            ax.plot(x, record.lp_import, color="#D1495B", linewidth=2.0, label="LP optimal")
+        if capacity_line is not None:
+            ax.plot(x, capacity_line, color="black", linestyle="--", linewidth=1.5, label="Capacity limit")
+        ax.set_title(f"Benchmark ep {record.episode}")
+        ax.set_xlabel("Hour")
+        ax.set_ylabel("Community import [kW]")
+        ax.set_xlim(1, len(x))
+        ax.grid(alpha=0.25)
+
+    ax_opt = axes[0, -1]
+    lp_import = benchmark_history[0].lp_import
+    if lp_import is not None:
+        ax_opt.bar(x, lp_import, width=0.9, color="#D1495B", label="LP optimal actions")
+    if capacity_line is not None:
+        ax_opt.plot(x, capacity_line, color="black", linestyle="--", linewidth=1.5, label="Capacity limit")
+    ax_opt.set_title("LP optimal actions")
+    ax_opt.set_xlabel("Hour")
+    ax_opt.set_ylabel("Community import [kW]")
+    ax_opt.set_xlim(1, len(x))
+    ax_opt.grid(alpha=0.25)
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=min(3, len(labels)))
+
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -463,20 +533,21 @@ def plot_returns(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Independent SAC for decentralized energy-community MARL")
     parser.add_argument("--n-prosumers", type=int, default=14)
-    parser.add_argument("--episodes", type=int, default=60)
+    parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=24)
-    parser.add_argument("--capacity-bonus", type=float, default=5.0)
+    parser.add_argument("--capacity-bonus", type=float, default=100.0)
     parser.add_argument("--data-dir", type=str, default="Data")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--buffer-size", type=int, default=100_000)
     parser.add_argument("--updates-per-step", type=int, default=1)
     parser.add_argument("--plot-path", type=str, default="Figures/independent_sac_returns.png")
+    parser.add_argument("--benchmark-actions-path", type=str, default="Figures/independent_sac_benchmark_actions.png")
     parser.add_argument("--no-randomize-scenarios", action="store_true",
                         help="Disable scenario randomization (use fixed Aug-2 data every episode)")
     parser.add_argument("--demand-noise-std", type=float, default=0.05)
-    parser.add_argument("--benchmark-interval", type=int, default=20)
+    parser.add_argument("--benchmark-interval", type=int, default=25)
     args = parser.parse_args()
 
     config = SACConfig(
@@ -496,10 +567,18 @@ def main() -> None:
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)
-    lp_baseline = benchmark_history[0][2] if benchmark_history else None
+    lp_baseline = benchmark_history[0].lp_reward if benchmark_history else None
     plot_path = Path(args.plot_path)
     plot_returns(episode_returns, plot_path, benchmark_history=benchmark_history, lp_baseline=lp_baseline)
+    benchmark_actions_path = Path(args.benchmark_actions_path)
+    plot_benchmark_actions(
+        benchmark_history,
+        benchmark_actions_path,
+        capacity_line=benchmark_history[0].lp_import if benchmark_history and benchmark_history[0].lp_import is not None else None,
+    )
     print(f"Saved return plot to: {plot_path}")
+    if benchmark_history:
+        print(f"Saved benchmark actions plot to: {benchmark_actions_path}")
 
 
 if __name__ == "__main__":
