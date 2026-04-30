@@ -92,30 +92,26 @@ def _parse_hour(time_str: str) -> int:
     return hour
 
 
-def _load_pv(csv_path: str | Path) -> np.ndarray:
-    """Load PV generation from renewables.ninja CSV, filter Aug 2 2019.
+def _load_pv(csv_path: str | Path, date: str = "2019-08-02") -> np.ndarray:
+    """Load PV generation from renewables.ninja CSV for a given date.
 
     Returns 24 hourly values (kW).
     """
     csv_path = Path(csv_path)
-    # Julia CSV.read: header=4 (1-indexed) → skip 3 metadata lines, use 4th as header
     df = pd.read_csv(csv_path, skiprows=3)
-
-    # Filter for August 2, 2019 (local_time in Europe/Copenhagen)
     df["local_time"] = pd.to_datetime(df["local_time"])
-    mask = (df["local_time"] >= pd.Timestamp("2019-08-02 00:00:00")) & (
-        df["local_time"] < pd.Timestamp("2019-08-03 00:00:00")
-    )
+    ts = pd.Timestamp(date)
+    mask = (df["local_time"] >= ts) & (df["local_time"] < ts + pd.Timedelta(days=1))
     day_data = df[mask]["electricity"].values.astype(np.float64)
 
     if len(day_data) != 24:
-        raise ValueError(f"Expected 24 hourly PV values for Aug 2 2019, got {len(day_data)}")
+        raise ValueError(f"Expected 24 hourly PV values for {date}, got {len(day_data)}")
 
     return day_data.astype(np.float32)
 
 
-def _load_spot_prices(csv_path: str | Path) -> np.ndarray:
-    """Load Nordpool spot prices, filter Aug 2 2021, apply taxes, reverse order.
+def _load_spot_prices(csv_path: str | Path, date: str = "2021-08-02") -> np.ndarray:
+    """Load Nordpool spot prices for a given date, apply taxes, reverse order.
 
     Replicates Julia:
         prices = reverse(price0208DKK/1000 .+ elafgift .+ tso)
@@ -125,31 +121,30 @@ def _load_spot_prices(csv_path: str | Path) -> np.ndarray:
     """
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
-
     df["HourDK"] = pd.to_datetime(df["HourDK"])
-    mask = (df["HourDK"] >= pd.Timestamp("2021-08-02 00:00:00")) & (
-        df["HourDK"] < pd.Timestamp("2021-08-03 00:00:00")
-    )
+    ts = pd.Timestamp(date)
+    mask = (df["HourDK"] >= ts) & (df["HourDK"] < ts + pd.Timedelta(days=1))
     day_prices = df[mask]["SpotPriceDKK"].values.astype(np.float64)
 
     if len(day_prices) != 24:
-        raise ValueError(f"Expected 24 hourly spot prices for Aug 2 2021, got {len(day_prices)}")
+        raise ValueError(f"Expected 24 hourly spot prices for {date}, got {len(day_prices)}")
 
-    # Julia divides by 1000 and adds taxes
     elafgift = 0.7630
     tso = 0.049 + 0.061 + 0.0022  # = 0.1122
     prices_with_tax = day_prices / 1000.0 + elafgift + tso
 
     # Julia does reverse() — CSV has latest hour first.
-    prices_chronological = prices_with_tax[::-1]
-
-    return prices_chronological.astype(np.float32)
+    return prices_with_tax[::-1].astype(np.float32)
 
 
 def load_data(
     data_root: str | Path = "Data",
     n_prosumers: int = 14,
     seed: int = 1234,
+    spot_date: str = "2021-08-02",
+    pv_date: str = "2019-08-02",
+    demand_noise_std: float = 0.0,
+    demand_noise_seed: int | None = None,
 ) -> dict[str, Any]:
     """Load all data matching the Julia pipeline from data processing.jl.
 
@@ -161,6 +156,14 @@ def load_data(
         Number of prosumers (dwellings) to load.
     seed : int
         RNG seed for battery sizing (must match Julia's Random.seed!(1234)).
+    spot_date : str
+        Date string (YYYY-MM-DD) for spot prices. Must be in the CSV.
+    pv_date : str
+        Date string (YYYY-MM-DD) for PV generation. Must be in the CSV.
+    demand_noise_std : float
+        Gaussian noise σ added to hourly demand (kWh/h). 0 = no noise.
+    demand_noise_seed : int | None
+        RNG seed for demand noise. None = unseeded.
 
     Returns
     -------
@@ -178,10 +181,14 @@ def load_data(
     else:
         D = np.zeros((n_prosumers, T), dtype=np.float32)
 
+    if demand_noise_std > 0.0:
+        rng_noise = np.random.default_rng(demand_noise_seed)
+        D = np.clip(D + rng_noise.normal(0.0, demand_noise_std, D.shape), 0.0, None).astype(np.float32)
+
     # --- PV generation ---
     pv_path = data_root / "PV.csv"
     if pv_path.exists():
-        pv_base = _load_pv(pv_path)  # shape (24,)
+        pv_base = _load_pv(pv_path, date=pv_date)  # shape (24,)
     else:
         pv_base = np.zeros(T, dtype=np.float32)
 
@@ -210,7 +217,7 @@ def load_data(
     # --- Spot prices ---
     price_path = data_root / "elspotprices.csv"
     if price_path.exists():
-        spot = _load_spot_prices(price_path)
+        spot = _load_spot_prices(price_path, date=spot_date)
     else:
         spot = np.zeros(T, dtype=np.float32)
 
@@ -268,6 +275,28 @@ def load_data(
         "p_dis_max": p_dis_max,
         "cap": cap,
     }
+
+
+def get_available_spot_dates(data_root: str | Path) -> list[str]:
+    """Return sorted list of YYYY-MM-DD date strings in elspotprices.csv with exactly 24 hours."""
+    price_path = Path(data_root) / "elspotprices.csv"
+    df = pd.read_csv(price_path)
+    df["HourDK"] = pd.to_datetime(df["HourDK"])
+    df["date"] = df["HourDK"].dt.strftime("%Y-%m-%d")
+    counts = df.groupby("date").size()
+    return sorted(counts[counts == 24].index.tolist())
+
+
+def get_available_pv_dates(
+    data_root: str | Path, months: tuple[int, ...] = (6, 7, 8, 9)
+) -> list[str]:
+    """Return sorted list of YYYY-MM-DD date strings in PV.csv for the given months."""
+    pv_path = Path(data_root) / "PV.csv"
+    df = pd.read_csv(pv_path, skiprows=3, usecols=["local_time"])
+    df["local_time"] = pd.to_datetime(df["local_time"])
+    mask = df["local_time"].dt.month.isin(months)
+    dates = sorted({d.strftime("%Y-%m-%d") for d in df.loc[mask, "local_time"].dt.date})
+    return dates
 
 
 # Quick self-test when run directly

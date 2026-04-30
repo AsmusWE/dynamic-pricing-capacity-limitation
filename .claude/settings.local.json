@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m pytest tests/ -v)"
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python3)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(python -m pytest tests/test_new_marl_environment.py -v)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_new_marl_environment.py tests/test_data_loader.py -v --tb=short)"
     ]
   }
 }
