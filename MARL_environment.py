@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +61,12 @@ class MARLEnvironment(ParallelEnv):
         self._norm_D = np.maximum(self.D.max(axis=1), 1e-8)   # (n,)
         self._norm_PV = np.maximum(self.PV.max(axis=1), 1e-8) # (n,)
 
+        # Spaces are identical for all agents — build once and reuse.
+        self._obs_space = spaces.Box(
+            low=0.0, high=1.0, shape=(6 * self.T + 2,), dtype=np.float32
+        )
+        self._act_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+
         # Episode state — populated by reset()
         self.agents: list[str] = []
         self.t: int = 0
@@ -71,18 +76,20 @@ class MARLEnvironment(ParallelEnv):
     # PettingZoo required interface
     # ------------------------------------------------------------------
 
-    @functools.lru_cache(maxsize=None)
     def observation_space(self, agent: str) -> spaces.Box:
         # [spot(T), cap(T), y_im(T), y_ex(T), D_i(T), PV_i(T), soc_i(1), t(1)]
-        # All values normalized to [0, 1]; bounds include a small margin.
-        return spaces.Box(low=0.0, high=1.0, shape=(6 * self.T + 2,), dtype=np.float32)
+        # All values normalized to [0, 1].
+        return self._obs_space
 
-    @functools.lru_cache(maxsize=None)
     def action_space(self, agent: str) -> spaces.Box:
         # +1 = full charge at p_ch_max, -1 = full discharge at p_dis_max
-        return spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        return self._act_space
 
-    def reset(self, seed: int | None = None, options: dict | None = None):
+    def reset(
+        self,
+        seed: int | None = None,
+        options: dict | None = None,
+    ) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
         self.agents = self.possible_agents[:]
         self.t = 0
         rng = np.random.default_rng(seed)
@@ -92,7 +99,16 @@ class MARLEnvironment(ParallelEnv):
         infos: dict[str, dict] = {agent: {} for agent in self.agents}
         return observations, infos
 
-    def step(self, actions: dict[str, np.ndarray]):
+    def step(
+        self,
+        actions: dict[str, np.ndarray],
+    ) -> tuple[
+        dict[str, np.ndarray],
+        dict[str, float],
+        dict[str, bool],
+        dict[str, bool],
+        dict[str, dict],
+    ]:
         t = self.t
 
         # 1. Battery power from normalized actions
