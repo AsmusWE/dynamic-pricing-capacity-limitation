@@ -58,6 +58,7 @@ class BenchmarkRollout:
     episode: int
     policy_reward: float
     policy_import: np.ndarray
+    total_charging_reward: float
     lp_reward: float | None
     lp_import: np.ndarray | None
 
@@ -156,6 +157,8 @@ class SACConfig:
     demand_noise_std: float = 0.05
     benchmark_interval: int = 50
     centralized: bool = False
+    alpha_grid: float = 75.0
+    violation_discharge_reward: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -272,26 +275,31 @@ def _run_reference_episode(
     env: MARLEnvironment,
     actor: Actor,
     n: int,
+    battery_idx: list[int],
     device: torch.device,
     *,
     deterministic: bool,
     lp_actions: np.ndarray | None = None,
     centralized: bool = False,
-) -> tuple[float, np.ndarray]:
-    """Run one episode on the reference scenario and return total reward and hourly import.
+) -> tuple[float, np.ndarray, float]:
+    """Run one episode on the reference scenario and return total reward, hourly import, and total charging reward.
 
-    centralized=True: actor receives the full centralized obs and outputs all n actions.
-    centralized=False: shared actor receives per-agent obs + one-hot and outputs 1 action.
-    If lp_actions is provided, uses those instead of the policy (always per-agent).
+    centralized=True: actor receives the full centralized obs and outputs n_battery actions.
+    centralized=False: shared actor receives per-battery-agent obs + one-hot, outputs 1 action.
+    Battery-less agents always receive action=0. LP actions are applied per-agent when provided.
     """
-    one_hots = np.eye(n, dtype=np.float32)
+    n_battery = len(battery_idx)
+    one_hots = np.eye(n_battery, dtype=np.float32)
     obs_dict, _ = env.reset(options={"reference": True})
     obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
     total_reward = 0.0
+    total_charging_reward = 0.0
     hourly_import: list[float] = []
     t = 0
     while env.agents:
-        actions_dict: dict[str, np.ndarray] = {}
+        actions_dict: dict[str, np.ndarray] = {
+            f"consumer_{i}": np.zeros(1, dtype=np.float32) for i in range(n) if env.E_max[i] == 0
+        }
         if lp_actions is not None:
             for i in range(n):
                 actions_dict[f"consumer_{i}"] = np.array([lp_actions[i, t]], dtype=np.float32)
@@ -301,22 +309,26 @@ def _run_reference_episode(
             with torch.no_grad():
                 _, _, det_a = actor.sample(obs_t)
             all_actions = det_a.squeeze(0).cpu().numpy().astype(np.float32)
-            for i in range(n):
-                actions_dict[f"consumer_{i}"] = all_actions[i : i + 1]
+            for j, i in enumerate(battery_idx):
+                actions_dict[f"consumer_{i}"] = all_actions[j : j + 1]
         else:
-            obs_batch = np.stack([np.concatenate([obs[i], one_hots[i]]) for i in range(n)])
+            obs_batch = np.stack([np.concatenate([obs[battery_idx[j]], one_hots[j]]) for j in range(n_battery)])
             obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
             with torch.no_grad():
                 _, _, det_a = actor.sample(obs_t)
             all_actions = det_a.cpu().numpy()
-            for i in range(n):
-                actions_dict[f"consumer_{i}"] = all_actions[i]
+            for j, i in enumerate(battery_idx):
+                actions_dict[f"consumer_{i}"] = all_actions[j]
         next_obs_dict, rewards, _, _, infos = env.step(actions_dict)
         total_reward += sum(rewards.values())
         hourly_import.append(float(sum(info["p_plus"] for info in infos.values())))
+        if infos["consumer_0"]["capacity_violation"] > 1e-4:
+            total_charging_reward += env.violation_discharge_reward * sum(
+                infos[f"consumer_{i}"]["p_ch"] for i in range(n)
+            )
         obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
         t += 1
-    return total_reward, np.asarray(hourly_import, dtype=np.float32)
+    return total_reward, np.asarray(hourly_import, dtype=np.float32), total_charging_reward
 
 
 # ---------------------------------------------------------------------------
@@ -337,23 +349,34 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
         randomize_scenarios=config.randomize_scenarios,
         demand_noise_std=config.demand_noise_std,
         scenario_seed=config.seed,
+        alpha_grid=config.alpha_grid,
+        violation_discharge_reward=config.violation_discharge_reward,
     )
     n = env._n
-    one_hots = np.eye(n, dtype=np.float32)  # precomputed; row i = one-hot for agent i
     obs_dim = 6 * config.horizon + 2  # 146 for T=24
 
+    # Only agents with a battery have meaningful actions; skip the rest entirely.
+    battery_idx: list[int] = [i for i in range(n) if env.E_max[i] > 0]
+    n_battery = len(battery_idx)
+    print(f"Battery agents: {battery_idx}  ({n_battery}/{n} prosumers)")
+
     if config.centralized:
-        # Single central agent: obs = global(97) + n×private(49); action = all n prosumer actions
+        # Single central agent: obs = global(97) + all-n private states (49 each);
+        # action covers only the n_battery agents that have a battery.
         net_obs_dim = 97 + n * 49
-        net_action_dim = n
-        action_low = np.full(n, -1.0, dtype=np.float32)
-        action_high = np.full(n, 1.0, dtype=np.float32)
+        net_action_dim = n_battery
+        action_low = np.full(n_battery, -1.0, dtype=np.float32)
+        action_high = np.full(n_battery, 1.0, dtype=np.float32)
     else:
-        # Shared network per agent: per-agent obs with one-hot agent ID appended
-        net_obs_dim = obs_dim + n
+        # Shared network: per-battery-agent obs + one-hot over battery agents only.
+        net_obs_dim = obs_dim + n_battery
         net_action_dim = 1
         action_low = np.array([-1.0], dtype=np.float32)
         action_high = np.array([1.0], dtype=np.float32)
+
+    # One-hot matrix: row j is the identity vector for battery_idx[j].
+    # Used only in non-centralized mode, but always computed to keep type checker happy.
+    one_hots = np.eye(n_battery, dtype=np.float32)
 
     target_entropy = -float(net_action_dim) * 3
 
@@ -373,8 +396,8 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     lp_baseline: float | None = None
     lp_reference_import: np.ndarray | None = None
     if lp_actions is not None:
-        lp_baseline, lp_reference_import = _run_reference_episode(
-            env, actor, n, device, deterministic=True, lp_actions=lp_actions,
+        lp_baseline, lp_reference_import, _ = _run_reference_episode(
+            env, actor, n, battery_idx, device, deterministic=True, lp_actions=lp_actions,
             centralized=config.centralized,
         )
         print(f"LP baseline reward (reference day): {lp_baseline:.4f}")
@@ -392,39 +415,47 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
 
         _t = time.perf_counter()
         raw_obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
+        central_obs: np.ndarray = np.empty(0, dtype=np.float32)
+        batt_obs: list[np.ndarray] = []
         if config.centralized:
-            net_obs = [_build_central_obs(raw_obs)]
+            central_obs = _build_central_obs(raw_obs)
         else:
-            net_obs = [np.concatenate([raw_obs[i], one_hots[i]]) for i in range(n)]
+            # Only build network observations for battery agents (rank j → env agent battery_idx[j])
+            batt_obs = [np.concatenate([raw_obs[battery_idx[j]], one_hots[j]]) for j in range(n_battery)]
         t_obs += time.perf_counter() - _t
         ep_return = 0.0
 
         while env.agents:
-            actions_dict: dict[str, np.ndarray] = {}
+            # Battery-less agents always receive action=0 (no battery means no action)
+            actions_dict: dict[str, np.ndarray] = {
+                f"consumer_{i}": np.zeros(1, dtype=np.float32) for i in range(n) if env.E_max[i] == 0
+            }
 
             _t = time.perf_counter()
             if config.centralized:
                 if total_steps < config.warmup_steps:
-                    all_a = np.array([env.action_space(f"consumer_{i}").sample()[0] for i in range(n)], dtype=np.float32)
+                    all_a = np.array(
+                        [env.action_space(f"consumer_{battery_idx[j]}").sample()[0] for j in range(n_battery)],
+                        dtype=np.float32,
+                    )
                 else:
-                    obs_t = torch.as_tensor(net_obs[0], dtype=torch.float32, device=device).unsqueeze(0)
+                    obs_t = torch.as_tensor(central_obs, dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
                         a_t, _, _ = actor.sample(obs_t)
                     all_a = a_t.squeeze(0).cpu().numpy().astype(np.float32)
-                for i in range(n):
-                    actions_dict[f"consumer_{i}"] = all_a[i : i + 1]
+                for j, i in enumerate(battery_idx):
+                    actions_dict[f"consumer_{i}"] = all_a[j : j + 1]
             else:
                 if total_steps < config.warmup_steps:
-                    for i in range(n):
+                    for i in battery_idx:
                         actions_dict[f"consumer_{i}"] = env.action_space(f"consumer_{i}").sample()
                 else:
-                    # Single batched forward pass for all agents instead of 14 sequential ones
-                    obs_batch = torch.as_tensor(np.stack(net_obs), dtype=torch.float32, device=device)
+                    obs_batch = torch.as_tensor(np.stack(batt_obs), dtype=torch.float32, device=device)
                     with torch.no_grad():
                         a_batch, _, _ = actor.sample(obs_batch)
                     all_actions_np = a_batch.cpu().numpy()
-                    for i in range(n):
-                        actions_dict[f"consumer_{i}"] = all_actions_np[i]
+                    for j, i in enumerate(battery_idx):
+                        actions_dict[f"consumer_{i}"] = all_actions_np[j]
             t_action += time.perf_counter() - _t
 
             _t = time.perf_counter()
@@ -432,21 +463,20 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             t_step += time.perf_counter() - _t
 
             done = any(terms.values())
+            ep_return += sum(rewards.values())
 
             _t = time.perf_counter()
             next_raw_obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
             if config.centralized:
-                next_net_obs = [_build_central_obs(next_raw_obs)]
-                central_action = np.concatenate([actions_dict[f"consumer_{i}"] for i in range(n)])
-                total_reward = float(sum(rewards.values()))
-                buffer.add(net_obs[0], central_action, total_reward, next_net_obs[0], done)
-                ep_return += total_reward
+                next_central_obs = _build_central_obs(next_raw_obs)
+                central_action = np.concatenate([actions_dict[f"consumer_{battery_idx[j]}"] for j in range(n_battery)])
+                buffer.add(central_obs, central_action, float(sum(rewards.values())), next_central_obs, done)
+                central_obs = next_central_obs
             else:
-                next_net_obs = [np.concatenate([next_raw_obs[i], one_hots[i]]) for i in range(n)]
-                for i in range(n):
-                    buffer.add(net_obs[i], actions_dict[f"consumer_{i}"], rewards[f"consumer_{i}"], next_net_obs[i], done)
-                    ep_return += rewards[f"consumer_{i}"]
-            net_obs = next_net_obs
+                next_batt_obs = [np.concatenate([next_raw_obs[battery_idx[j]], one_hots[j]]) for j in range(n_battery)]
+                for j, i in enumerate(battery_idx):
+                    buffer.add(batt_obs[j], actions_dict[f"consumer_{i}"], rewards[f"consumer_{i}"], next_batt_obs[j], done)
+                batt_obs = next_batt_obs
             t_buffer += time.perf_counter() - _t
 
             total_steps += 1
@@ -472,8 +502,8 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
 
         if (episode + 1) % config.benchmark_interval == 0:
             _t = time.perf_counter()
-            policy_reward, policy_import = _run_reference_episode(
-                env, actor, n, device, deterministic=True, centralized=config.centralized
+            policy_reward, policy_import, policy_discharge_bonus = _run_reference_episode(
+                env, actor, n, battery_idx, device, deterministic=True, centralized=config.centralized
             )
             t_benchmark += time.perf_counter() - _t
             benchmark_history.append(
@@ -481,19 +511,23 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
                     episode=episode + 1,
                     policy_reward=policy_reward,
                     policy_import=policy_import,
+                    total_charging_reward=policy_discharge_bonus,
                     lp_reward=lp_baseline,
                     lp_import=lp_reference_import,
                 )
             )
+            total_import = float(policy_import.sum())
             if lp_baseline is not None:
                 print(
                     f"  [Benchmark ep {episode + 1}] "
-                    f"policy={policy_reward:.4f}  lp_baseline={lp_baseline:.4f}"
+                    f"policy={policy_reward:.4f}  lp_baseline={lp_baseline:.4f}  "
+                    f"total_import={total_import:.2f} kW  discharge_bonus={policy_discharge_bonus:.4f}"
                 )
             else:
                 print(
                     f"  [Benchmark ep {episode + 1}] "
-                    f"policy={policy_reward:.4f}  lp_baseline=N/A"
+                    f"policy={policy_reward:.4f}  lp_baseline=N/A  "
+                    f"total_import={total_import:.2f} kW  discharge_bonus={policy_discharge_bonus:.4f}"
                 )
 
     total_t = t_reset + t_obs + t_action + t_step + t_buffer + t_update + t_benchmark
@@ -625,9 +659,9 @@ def plot_benchmark_actions(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Independent SAC for decentralized energy-community MARL")
     parser.add_argument("--n-prosumers", type=int, default=14)
-    parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--episodes", type=int, default=300)
     parser.add_argument("--horizon", type=int, default=24)
-    parser.add_argument("--capacity-bonus", type=float, default=100.0)
+    parser.add_argument("--capacity-bonus", type=float, default=50.0)
     parser.add_argument("--data-dir", type=str, default="Data")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-steps", type=int, default=100)
@@ -639,7 +673,11 @@ def main() -> None:
     parser.add_argument("--no-randomize-scenarios", action="store_true",
                         help="Disable scenario randomization (use fixed Aug-2 data every episode)")
     parser.add_argument("--demand-noise-std", type=float, default=0.05)
-    parser.add_argument("--benchmark-interval", type=int, default=25)
+    parser.add_argument("--benchmark-interval", type=int, default=100)
+    parser.add_argument("--alpha-grid", type=float, default=75.0,
+                        help="Capacity violation penalty coefficient (default: 75.0, same as Julia model)")
+    parser.add_argument("--violation-discharge-reward", type=float, default=50,
+                        help="Extra reward per kW discharged during a violation step (default: 0.0, disabled)")
     parser.add_argument("--centralized", action="store_true",
                         help="Use a single central agent whose obs is all consumer states "
                              "(global features once + per-agent D/PV/SoC) and whose action "
@@ -661,6 +699,8 @@ def main() -> None:
         demand_noise_std=args.demand_noise_std,
         benchmark_interval=args.benchmark_interval,
         centralized=args.centralized,
+        alpha_grid=args.alpha_grid,
+        violation_discharge_reward=args.violation_discharge_reward,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)

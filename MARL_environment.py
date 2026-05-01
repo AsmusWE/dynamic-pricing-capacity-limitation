@@ -45,6 +45,8 @@ class MARLEnvironment(ParallelEnv):
         randomize_scenarios: bool = False,
         demand_noise_std: float = 0.05,
         scenario_seed: int = 0,
+        alpha_grid: float | None = None,
+        violation_discharge_reward: float = 0.0,
     ):
         super().__init__()
         self._n = int(n_prosumers)
@@ -75,7 +77,8 @@ class MARLEnvironment(ParallelEnv):
         self.p_ch_max: np.ndarray = ref_data["p_ch_max"].astype(np.float32)
         self.p_dis_max: np.ndarray = ref_data["p_dis_max"].astype(np.float32)
         self.eta: float = float(ref_data["eta"])
-        self.alpha_grid: float = float(ref_data["alpha_grid"])
+        self.alpha_grid: float = float(alpha_grid) if alpha_grid is not None else float(ref_data["alpha_grid"])
+        self.violation_discharge_reward: float = float(violation_discharge_reward)
         self.y_im: np.ndarray = ref_data["y_im"].astype(np.float32)
         self.y_ex: np.ndarray = ref_data["y_ex"].astype(np.float32)
         # max_cap needed for PV scaling
@@ -208,11 +211,15 @@ class MARLEnvironment(ParallelEnv):
         )
         collective = (
             self.capacity_bonus
-            if violation == 0.0
+            if violation <= 1e-4
             else -self.alpha_grid * violation / self._n
         )
         rewards = {
-            f"consumer_{i}": float(-individual_cost[i] + collective)
+            f"consumer_{i}": float(
+                -individual_cost[i]
+                + collective
+                + (self.violation_discharge_reward * p_dis[i] if violation > 1e-4 else 0.0)
+            )
             for i in range(self._n)
         }
 
