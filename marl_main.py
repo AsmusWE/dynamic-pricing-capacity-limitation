@@ -4,6 +4,7 @@ import argparse
 import copy
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import cast
 
 import matplotlib.pyplot as plt
@@ -154,6 +155,7 @@ class SACConfig:
     randomize_scenarios: bool = True
     demand_noise_std: float = 0.05
     benchmark_interval: int = 50
+    centralized: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +166,24 @@ class SACConfig:
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+# Per-agent obs layout (T=24): spot(0:24) cap(24:48) y_im(48:72) y_ex(72:96)
+#   D[i](96:120) PV[i](120:144) SoC[i](144) time(145)
+_GLOBAL_OBS_SLICE = slice(0, 96)    # spot+cap+y_im+y_ex — identical across agents
+_PRIVATE_OBS_SLICE = slice(96, 145) # D[i]+PV[i]+SoC[i] — 49 features, per-agent
+_TIME_OBS_IDX = 145
+
+
+def _build_central_obs(obs_list: list[np.ndarray]) -> np.ndarray:
+    """Centralized obs: [global(97), agent_0_private(49), ..., agent_N_private(49)].
+
+    Global = spot+cap+y_im+y_ex (96) + time (1) = 97 (no repetition of shared features).
+    Private per agent = D[i]+PV[i]+SoC[i] = 49 each.
+    """
+    global_feats = np.append(obs_list[0][_GLOBAL_OBS_SLICE], obs_list[0][_TIME_OBS_IDX])
+    per_agent = np.concatenate([obs[_PRIVATE_OBS_SLICE] for obs in obs_list])
+    return np.concatenate([global_feats, per_agent]).astype(np.float32)
 
 
 def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
@@ -250,18 +270,21 @@ def _load_lp_actions(data_dir: str) -> np.ndarray | None:
 
 def _run_reference_episode(
     env: MARLEnvironment,
-    actors: list,
+    actor: Actor,
     n: int,
     device: torch.device,
     *,
     deterministic: bool,
     lp_actions: np.ndarray | None = None,
+    centralized: bool = False,
 ) -> tuple[float, np.ndarray]:
     """Run one episode on the reference scenario and return total reward and hourly import.
 
-    If deterministic=True, uses the actor mean (no exploration).
-    If lp_actions is provided, uses those instead of the policy.
+    centralized=True: actor receives the full centralized obs and outputs all n actions.
+    centralized=False: shared actor receives per-agent obs + one-hot and outputs 1 action.
+    If lp_actions is provided, uses those instead of the policy (always per-agent).
     """
+    one_hots = np.eye(n, dtype=np.float32)
     obs_dict, _ = env.reset(options={"reference": True})
     obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
     total_reward = 0.0
@@ -269,18 +292,25 @@ def _run_reference_episode(
     t = 0
     while env.agents:
         actions_dict: dict[str, np.ndarray] = {}
-        for i in range(n):
-            if lp_actions is not None:
-                a = np.array([lp_actions[i, t]], dtype=np.float32)
-            else:
-                obs_t = torch.as_tensor(obs[i], dtype=torch.float32, device=device).unsqueeze(0)
-                with torch.no_grad():
-                    _, _, det_a = actors[i].sample(obs_t)
-                if deterministic:
-                    a = det_a.squeeze(0).cpu().numpy().astype(np.float32)
-                else:
-                    a = det_a.squeeze(0).cpu().numpy().astype(np.float32)
-            actions_dict[f"consumer_{i}"] = a
+        if lp_actions is not None:
+            for i in range(n):
+                actions_dict[f"consumer_{i}"] = np.array([lp_actions[i, t]], dtype=np.float32)
+        elif centralized:
+            central_obs = _build_central_obs(obs)
+            obs_t = torch.as_tensor(central_obs, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                _, _, det_a = actor.sample(obs_t)
+            all_actions = det_a.squeeze(0).cpu().numpy().astype(np.float32)
+            for i in range(n):
+                actions_dict[f"consumer_{i}"] = all_actions[i : i + 1]
+        else:
+            obs_batch = np.stack([np.concatenate([obs[i], one_hots[i]]) for i in range(n)])
+            obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                _, _, det_a = actor.sample(obs_t)
+            all_actions = det_a.cpu().numpy()
+            for i in range(n):
+                actions_dict[f"consumer_{i}"] = all_actions[i]
         next_obs_dict, rewards, _, _, infos = env.step(actions_dict)
         total_reward += sum(rewards.values())
         hourly_import.append(float(sum(info["p_plus"] for info in infos.values())))
@@ -295,7 +325,7 @@ def _run_reference_episode(
 
 
 def train_independent_sac(config: SACConfig) -> tuple[list[float], list[BenchmarkRollout]]:
-    """Train N independent SAC agents, one per prosumer."""
+    """Train a shared SAC policy for all prosumers, distinguished by one-hot agent ID."""
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -309,25 +339,34 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
         scenario_seed=config.seed,
     )
     n = env._n
+    one_hots = np.eye(n, dtype=np.float32)  # precomputed; row i = one-hot for agent i
     obs_dim = 6 * config.horizon + 2  # 146 for T=24
-    action_dim = 1
-    action_low = np.array([-1.0], dtype=np.float32)
-    action_high = np.array([1.0], dtype=np.float32)
-    target_entropy = -float(action_dim)*10
 
-    actors = [
-        Actor(obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
-        for _ in range(n)
-    ]
-    critics = [Critic(obs_dim, action_dim, config.hidden_dim).to(device) for _ in range(n)]
-    target_critics = [copy.deepcopy(critics[i]) for i in range(n)]
+    if config.centralized:
+        # Single central agent: obs = global(97) + n×private(49); action = all n prosumer actions
+        net_obs_dim = 97 + n * 49
+        net_action_dim = n
+        action_low = np.full(n, -1.0, dtype=np.float32)
+        action_high = np.full(n, 1.0, dtype=np.float32)
+    else:
+        # Shared network per agent: per-agent obs with one-hot agent ID appended
+        net_obs_dim = obs_dim + n
+        net_action_dim = 1
+        action_low = np.array([-1.0], dtype=np.float32)
+        action_high = np.array([1.0], dtype=np.float32)
 
-    log_alphas = [torch.tensor(0.0, device=device, requires_grad=True) for _ in range(n)]
-    actor_optims = [torch.optim.Adam(actors[i].parameters(), lr=config.actor_lr) for i in range(n)]
-    critic_optims = [torch.optim.Adam(critics[i].parameters(), lr=config.critic_lr) for i in range(n)]
-    alpha_optims = [torch.optim.Adam([log_alphas[i]], lr=config.alpha_lr) for i in range(n)]
+    target_entropy = -float(net_action_dim) * 3
 
-    buffers = [ReplayBuffer(config.buffer_size, obs_dim, action_dim) for _ in range(n)]
+    actor = Actor(net_obs_dim, net_action_dim, action_low, action_high, config.hidden_dim).to(device)
+    critic = Critic(net_obs_dim, net_action_dim, config.hidden_dim).to(device)
+    target_critic = copy.deepcopy(critic)
+
+    log_alpha = torch.tensor(0.0, device=device, requires_grad=True)
+    actor_optim = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
+    critic_optim = torch.optim.Adam(critic.parameters(), lr=config.critic_lr)
+    alpha_optim = torch.optim.Adam([log_alpha], lr=config.alpha_lr)
+
+    buffer = ReplayBuffer(config.buffer_size, net_obs_dim, net_action_dim)
 
     # Load LP baseline (optional — requires running extract_optimal_actions.jl first)
     lp_actions = _load_lp_actions(config.data_dir)
@@ -335,7 +374,8 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     lp_reference_import: np.ndarray | None = None
     if lp_actions is not None:
         lp_baseline, lp_reference_import = _run_reference_episode(
-            env, actors, n, device, deterministic=True, lp_actions=lp_actions
+            env, actor, n, device, deterministic=True, lp_actions=lp_actions,
+            centralized=config.centralized,
         )
         print(f"LP baseline reward (reference day): {lp_baseline:.4f}")
 
@@ -343,64 +383,99 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     episode_returns: list[float] = []
     benchmark_history: list[BenchmarkRollout] = []
 
+    t_reset = t_obs = t_action = t_step = t_buffer = t_update = t_benchmark = 0.0
+
     for episode in range(config.episodes):
+        _t = time.perf_counter()
         obs_dict, _ = env.reset()
-        obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
+        t_reset += time.perf_counter() - _t
+
+        _t = time.perf_counter()
+        raw_obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
+        if config.centralized:
+            net_obs = [_build_central_obs(raw_obs)]
+        else:
+            net_obs = [np.concatenate([raw_obs[i], one_hots[i]]) for i in range(n)]
+        t_obs += time.perf_counter() - _t
         ep_return = 0.0
 
         while env.agents:
-            # Collect actions for all agents
             actions_dict: dict[str, np.ndarray] = {}
-            for i in range(n):
+
+            _t = time.perf_counter()
+            if config.centralized:
                 if total_steps < config.warmup_steps:
-                    a = env.action_space(f"consumer_{i}").sample()
+                    all_a = np.array([env.action_space(f"consumer_{i}").sample()[0] for i in range(n)], dtype=np.float32)
                 else:
-                    obs_t = torch.as_tensor(obs[i], dtype=torch.float32, device=device).unsqueeze(0)
+                    obs_t = torch.as_tensor(net_obs[0], dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
-                        a_t, _, _ = actors[i].sample(obs_t)
-                    a = a_t.squeeze(0).cpu().numpy().astype(np.float32)
-                actions_dict[f"consumer_{i}"] = a
+                        a_t, _, _ = actor.sample(obs_t)
+                    all_a = a_t.squeeze(0).cpu().numpy().astype(np.float32)
+                for i in range(n):
+                    actions_dict[f"consumer_{i}"] = all_a[i : i + 1]
+            else:
+                if total_steps < config.warmup_steps:
+                    for i in range(n):
+                        actions_dict[f"consumer_{i}"] = env.action_space(f"consumer_{i}").sample()
+                else:
+                    # Single batched forward pass for all agents instead of 14 sequential ones
+                    obs_batch = torch.as_tensor(np.stack(net_obs), dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        a_batch, _, _ = actor.sample(obs_batch)
+                    all_actions_np = a_batch.cpu().numpy()
+                    for i in range(n):
+                        actions_dict[f"consumer_{i}"] = all_actions_np[i]
+            t_action += time.perf_counter() - _t
 
+            _t = time.perf_counter()
             next_obs_dict, rewards, terms, truncs, infos = env.step(actions_dict)
+            t_step += time.perf_counter() - _t
+
             done = any(terms.values())
-            next_obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
 
-            for i in range(n):
-                buffers[i].add(
-                    obs[i],
-                    actions_dict[f"consumer_{i}"],
-                    rewards[f"consumer_{i}"],
-                    next_obs[i],
-                    done,
-                )
-                ep_return += rewards[f"consumer_{i}"]
+            _t = time.perf_counter()
+            next_raw_obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
+            if config.centralized:
+                next_net_obs = [_build_central_obs(next_raw_obs)]
+                central_action = np.concatenate([actions_dict[f"consumer_{i}"] for i in range(n)])
+                total_reward = float(sum(rewards.values()))
+                buffer.add(net_obs[0], central_action, total_reward, next_net_obs[0], done)
+                ep_return += total_reward
+            else:
+                next_net_obs = [np.concatenate([next_raw_obs[i], one_hots[i]]) for i in range(n)]
+                for i in range(n):
+                    buffer.add(net_obs[i], actions_dict[f"consumer_{i}"], rewards[f"consumer_{i}"], next_net_obs[i], done)
+                    ep_return += rewards[f"consumer_{i}"]
+            net_obs = next_net_obs
+            t_buffer += time.perf_counter() - _t
 
-            obs = next_obs
             total_steps += 1
 
-            # Independent SAC update per agent
-            if total_steps > config.warmup_steps and buffers[0].size >= config.batch_size:
+            _t = time.perf_counter()
+            if total_steps > config.warmup_steps and buffer.size >= config.batch_size:
                 for _ in range(config.updates_per_step):
-                    for i in range(n):
-                        _update_agent(
-                            actors[i], critics[i], target_critics[i],
-                            buffers[i], log_alphas[i],
-                            actor_optims[i], critic_optims[i], alpha_optims[i],
-                            config, target_entropy, device,
-                        )
+                    _update_agent(
+                        actor, critic, target_critic,
+                        buffer, log_alpha,
+                        actor_optim, critic_optim, alpha_optim,
+                        config, target_entropy, device,
+                    )
+            t_update += time.perf_counter() - _t
 
         avg_return = ep_return / (n * config.horizon)
         episode_returns.append(avg_return)
-        alpha_value = float(torch.stack([log_alpha.exp().detach() for log_alpha in log_alphas]).mean().cpu())
+        alpha_value = float(log_alpha.exp().detach().cpu())
         print(
             f"Episode {episode + 1:4d}/{config.episodes}: "
             f"avg_return={avg_return:10.4f}  alpha={alpha_value:8.4f}  steps={total_steps}"
         )
 
         if (episode + 1) % config.benchmark_interval == 0:
+            _t = time.perf_counter()
             policy_reward, policy_import = _run_reference_episode(
-                env, actors, n, device, deterministic=True
+                env, actor, n, device, deterministic=True, centralized=config.centralized
             )
+            t_benchmark += time.perf_counter() - _t
             benchmark_history.append(
                 BenchmarkRollout(
                     episode=episode + 1,
@@ -420,6 +495,23 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
                     f"  [Benchmark ep {episode + 1}] "
                     f"policy={policy_reward:.4f}  lp_baseline=N/A"
                 )
+
+    total_t = t_reset + t_obs + t_action + t_step + t_buffer + t_update + t_benchmark
+    rows = [
+        ("env.reset()",        t_reset),
+        ("obs build",          t_obs),
+        ("action selection",   t_action),
+        ("env.step()",         t_step),
+        ("buffer add",         t_buffer),
+        ("SAC update",         t_update),
+        ("benchmark rollouts", t_benchmark),
+    ]
+    print("\n─── Timing breakdown ────────────────────────────")
+    for label, secs in rows:
+        pct = 100 * secs / total_t if total_t > 0 else 0.0
+        print(f"  {label:<22s} {secs:7.2f}s  ({pct:5.1f}%)")
+    print(f"  {'TOTAL':<22s} {total_t:7.2f}s")
+    print("─────────────────────────────────────────────────")
 
     return episode_returns, benchmark_history
 
@@ -538,7 +630,7 @@ def main() -> None:
     parser.add_argument("--capacity-bonus", type=float, default=100.0)
     parser.add_argument("--data-dir", type=str, default="Data")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--buffer-size", type=int, default=100_000)
     parser.add_argument("--updates-per-step", type=int, default=1)
@@ -548,6 +640,10 @@ def main() -> None:
                         help="Disable scenario randomization (use fixed Aug-2 data every episode)")
     parser.add_argument("--demand-noise-std", type=float, default=0.05)
     parser.add_argument("--benchmark-interval", type=int, default=25)
+    parser.add_argument("--centralized", action="store_true",
+                        help="Use a single central agent whose obs is all consumer states "
+                             "(global features once + per-agent D/PV/SoC) and whose action "
+                             "is all consumer actions concatenated.")
     args = parser.parse_args()
 
     config = SACConfig(
@@ -564,6 +660,7 @@ def main() -> None:
         randomize_scenarios=not args.no_randomize_scenarios,
         demand_noise_std=args.demand_noise_std,
         benchmark_interval=args.benchmark_interval,
+        centralized=args.centralized,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)
