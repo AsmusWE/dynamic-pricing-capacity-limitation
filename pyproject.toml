@@ -53,7 +53,7 @@ Repository = "https://github.com/asmuswel/dynamic-pricing-capacity-limitation.gi
 Issues = "https://github.com/asmuswel/dynamic-pricing-capacity-limitation/issues"
 
 [tool.setuptools]
-packages = ["."]
+py-modules = ["marl_main"]
 
 [tool.black]
 line-length = 100
