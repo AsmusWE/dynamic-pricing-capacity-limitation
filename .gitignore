@@ -1,4 +1,6 @@
-/Figures
 Crowley et al. - 2025 - How can energy communities provide grid services A dynamic pricing mechanism with budget balance, i.pdf
 /.claude
 /.venv
+/.wandb
+*.wandb
+/figures
