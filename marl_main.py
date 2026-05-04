@@ -13,6 +13,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    import wandb  # type: ignore[import]
+except ImportError:
+    wandb = None  # type: ignore[assignment]
+
 from marl_environment import MARLEnvironment
 
 
@@ -162,6 +167,8 @@ class SACConfig:
     benchmark_interval: int = 50
     alpha_grid: float = 75.0
     violation_discharge_reward: float = 0.0
+    use_wandb: bool = False
+    wandb_project: str = "marl-energy"
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +339,11 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if config.use_wandb:
+        if wandb is None:
+            raise RuntimeError("wandb is not installed. Run: pip install wandb")
+        wandb.init(project=config.wandb_project, config=vars(config))
+
     env = MARLEnvironment(
         n_prosumers=config.n_prosumers,
         T=config.horizon,
@@ -460,6 +472,8 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             f"Episode {episode + 1:4d}/{config.episodes}: "
             f"avg_return={avg_return:10.4f}  alpha={alpha_val:8.4f}  steps={total_steps}"
         )
+        if config.use_wandb and wandb is not None:
+            wandb.log({"episode": episode + 1, "avg_return": avg_return, "alpha": alpha_val, "total_steps": total_steps})
 
         if (episode + 1) % config.benchmark_interval == 0:
             _t = time.perf_counter()
@@ -490,6 +504,18 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
                 f"  import={total_import:.2f} kW (LP: {lp_import_str} kW)"
                 f"  p_ch={float(policy_p_ch.sum()):.2f}  p_dis={float(policy_p_dis.sum()):.2f} kW"
             )
+            if config.use_wandb and wandb is not None:
+                bm_log: dict = {
+                    "episode": episode + 1,
+                    "benchmark/policy_reward": policy_reward,
+                    "benchmark/total_import_kw": total_import,
+                    "benchmark/p_ch_kw": float(policy_p_ch.sum()),
+                    "benchmark/p_dis_kw": float(policy_p_dis.sum()),
+                }
+                if lp_baseline is not None:
+                    bm_log["benchmark/lp_reward"] = lp_baseline
+                    bm_log["benchmark/pct_of_lp"] = 100.0 * policy_reward / lp_baseline
+                wandb.log(bm_log)
 
     total_t = t_reset + t_obs + t_action + t_step + t_buffer + t_update + t_benchmark
     rows = [
@@ -507,6 +533,9 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
         print(f"  {label:<22s} {secs:7.2f}s  ({pct:5.1f}%)")
     print(f"  {'TOTAL':<22s} {total_t:7.2f}s")
     print("─────────────────────────────────────────────────")
+
+    if config.use_wandb and wandb is not None:
+        wandb.finish()
 
     return episode_returns, benchmark_history
 
@@ -653,6 +682,9 @@ def main() -> None:
                         help="Capacity violation penalty coefficient (default: 75.0, same as Julia model)")
     parser.add_argument("--violation-discharge-reward", type=float, default=15,
                         help="Extra reward per kW discharged during a violation step (default: 0.0, disabled)")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="marl-energy",
+                        help="W&B project name (default: marl-energy)")
     args = parser.parse_args()
 
     config = SACConfig(
@@ -671,6 +703,8 @@ def main() -> None:
         benchmark_interval=args.benchmark_interval,
         alpha_grid=args.alpha_grid,
         violation_discharge_reward=args.violation_discharge_reward,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)
