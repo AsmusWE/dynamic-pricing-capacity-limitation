@@ -195,19 +195,23 @@ class MARLEnvironment(ParallelEnv):
                 desired = -a * self.p_dis_max[i]
                 p_dis[i] = min(desired, self.soc[i], self.p_dis_max[i])
 
-        # 2. Power balance (DC-side battery formulation, no load shedding)
+        # 2. Power balance per agent (DC-side, no load shedding)
         net_import = self.D[:, t] - self.PV[:, t] + p_ch / self.eta - self.eta * p_dis
+        # Per-agent position (for monitoring only)
         p_plus = np.maximum(0.0, net_import)
         p_minus = np.maximum(0.0, -net_import)
 
-        # 3. Community total import and capacity violation
-        total_import = float(p_plus.sum())
+        # 3. Community net exchange with grid — internal surpluses offset internal deficits
+        community_net = float(net_import.sum())
+        p_plus_community = max(0.0, community_net)   # community buys from grid
+        p_minus_community = max(0.0, -community_net)  # community sells to grid
+        total_import = p_plus_community
         violation = max(0.0, total_import - float(self.cap[t]))
 
-        # 4. Per-agent reward
+        # 4. Per-agent cost: each agent trades internally at spot; grid tariff is shared equally
         individual_cost = (
-            p_plus * (self.spot[t] + self.y_im[t])
-            - p_minus * (self.spot[t] - self.y_ex[t])
+            net_import * self.spot[t]
+            + (p_plus_community * self.y_im[t] - p_minus_community * self.y_ex[t]) / self._n
         )
         collective = (
             self.capacity_bonus
@@ -331,15 +335,41 @@ class MARLEnvironment(ParallelEnv):
         return spot, PV, D
 
     def _get_obs(self, i: int) -> np.ndarray:
+        """Build observation for agent i with remaining-day features padded to full length.
+        
+        Structure: [spot_remaining(T), cap_remaining(T), y_im_remaining(T), y_ex_remaining(T),
+                    soc(1), D_remaining(T), PV_remaining(T), hours_left(1)]
+        
+        Each "remaining" component starts at current hour self.t and is padded with 0's
+        to maintain constant length T.
+        """
         norm_soc = self.soc[i] / self.E_max[i] if self.E_max[i] > 0 else 0.0
+        hours_left = self.T - self.t
+        
+        # Create padded views of remaining features (from current hour t to end of day)
+        def pad_remaining(signal, norm_const):
+            remaining = signal[self.t:]
+            padded = np.zeros(self.T, dtype=np.float32)
+            n_remaining = len(remaining)
+            padded[:n_remaining] = remaining / norm_const
+            return padded
+        
+        spot_remaining = pad_remaining(self.spot, self._norm_spot)
+        cap_remaining = pad_remaining(self.cap, self._norm_cap)
+        y_im_remaining = pad_remaining(self.y_im, self._norm_y_im)
+        y_ex_remaining = pad_remaining(self.y_ex, self._norm_y_ex)
+        D_remaining = pad_remaining(self.D[i], self._norm_D[i])
+        PV_remaining = pad_remaining(self.PV[i], self._norm_PV[i])
+        
         obs = np.concatenate([
-            self.spot / self._norm_spot,
-            self.cap / self._norm_cap,
-            self.y_im / self._norm_y_im,
-            self.y_ex / self._norm_y_ex,
-            self.D[i] / self._norm_D[i],
-            self.PV[i] / self._norm_PV[i],
+            spot_remaining,
+            cap_remaining,
+            y_im_remaining,
+            y_ex_remaining,
             np.array([norm_soc], dtype=np.float32),
-            np.array([self.t / self.T], dtype=np.float32),
+            D_remaining,
+            PV_remaining,
+            np.array([hours_left / self.T], dtype=np.float32),
         ]).astype(np.float32)
+        
         return np.clip(obs, 0.0, 1.0)
