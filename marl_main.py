@@ -146,11 +146,11 @@ class SACConfig:
     horizon: int = 24
     capacity_bonus: float = 5.0
     data_dir: str = "Data"
-    gamma: float = 0.99
+    gamma: float = 0.999
     tau: float = 0.005
     actor_lr: float = 1e-3
     critic_lr: float = 1e-3
-    alpha_lr: float = 1e-3
+    alpha_lr: float = 5e-4
     batch_size: int = 256
     buffer_size: int = 100_000
     warmup_steps: int = 500
@@ -258,9 +258,10 @@ def _load_lp_actions(data_dir: str) -> np.ndarray | None:
 
 def _run_reference_episode(
     env: MARLEnvironment,
-    actors: list[Actor],
+    actor: Actor,
     n: int,
     battery_idx: list[int],
+    one_hots: np.ndarray,
     device: torch.device,
     *,
     lp_actions: np.ndarray | None = None,
@@ -285,11 +286,15 @@ def _run_reference_episode(
             for i in range(n):
                 actions_dict[f"consumer_{i}"] = np.array([lp_actions[i, t]], dtype=np.float32)
         else:
+            obs_batch = np.stack([
+                np.concatenate([obs[battery_idx[j]], one_hots[j]]) for j in range(len(battery_idx))
+            ])
+            obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                _, _, det_a = actor.sample(obs_t)
+            all_actions = det_a.cpu().numpy()
             for j, i in enumerate(battery_idx):
-                obs_t = torch.as_tensor(obs[i], dtype=torch.float32, device=device).unsqueeze(0)
-                with torch.no_grad():
-                    _, _, det_a = actors[j].sample(obs_t)
-                actions_dict[f"consumer_{i}"] = det_a.squeeze(0).cpu().numpy().astype(np.float32)
+                actions_dict[f"consumer_{i}"] = all_actions[j]
         next_obs_dict, rewards, _, _, infos = env.step(actions_dict)
         total_reward += sum(rewards.values())
         hourly_import.append(float(infos["consumer_0"]["total_import"]))
@@ -318,7 +323,12 @@ def _run_reference_episode(
 
 
 def train_independent_sac(config: SACConfig) -> tuple[list[float], list[BenchmarkRollout]]:
-    """Train independent SAC agents: one actor-critic pair per battery agent."""
+    """Train a shared SAC policy for all battery agents (CTDE).
+
+    Agents are distinguished by a one-hot identity vector appended to their observation.
+    A single actor-critic pair and replay buffer are used, reducing gradient steps from
+    n_battery per env-step to 1 — roughly an n_battery-fold speedup on the SAC update.
+    """
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -341,27 +351,28 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     n_battery = len(battery_idx)
     print(f"Battery agents: {battery_idx}  ({n_battery}/{n} prosumers)")
 
+    # One-hot identity per battery agent (row j → identity for battery_idx[j])
+    one_hots = np.eye(n_battery, dtype=np.float32)
+
     action_dim = 1
     action_low = np.array([-1.0], dtype=np.float32)
     action_high = np.array([1.0], dtype=np.float32)
+    # Network obs = env obs (146) + one-hot agent identity (n_battery)
+    net_obs_dim = obs_dim + n_battery
 
-    target_entropy = -float(action_dim) * 5
+    target_entropy = -float(action_dim) * 2
 
-    # Independent actors and critics for each battery agent
-    actors = [
-        Actor(obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
-        for _ in range(n_battery)
-    ]
-    critics = [Critic(obs_dim, action_dim, config.hidden_dim).to(device) for _ in range(n_battery)]
-    target_critics = [copy.deepcopy(critics[j]) for j in range(n_battery)]
+    # Shared actor-critic: all battery agents use the same weights
+    actor = Actor(net_obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
+    critic = Critic(net_obs_dim, action_dim, config.hidden_dim).to(device)
+    target_critic = copy.deepcopy(critic)
+    log_alpha = torch.tensor(0.0, device=device, requires_grad=True)
+    actor_optim = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
+    critic_optim = torch.optim.Adam(critic.parameters(), lr=config.critic_lr)
+    alpha_optim = torch.optim.Adam([log_alpha], lr=config.alpha_lr)
 
-    log_alphas = [torch.tensor(0.0, device=device, requires_grad=True) for _ in range(n_battery)]
-    actor_optims = [torch.optim.Adam(actors[j].parameters(), lr=config.actor_lr) for j in range(n_battery)]
-    critic_optims = [torch.optim.Adam(critics[j].parameters(), lr=config.critic_lr) for j in range(n_battery)]
-    alpha_optims = [torch.optim.Adam([log_alphas[j]], lr=config.alpha_lr) for j in range(n_battery)]
-
-    # Per-agent replay buffers
-    buffers = [ReplayBuffer(config.buffer_size, obs_dim, action_dim) for _ in range(n_battery)]
+    # Single shared replay buffer (all agents' transitions mixed together)
+    buffer = ReplayBuffer(config.buffer_size, net_obs_dim, action_dim)
 
     # Load LP baseline (optional — requires running extract_optimal_actions.jl first)
     lp_actions = _load_lp_actions(config.data_dir)
@@ -371,7 +382,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     lp_p_dis: np.ndarray | None = None
     if lp_actions is not None:
         lp_baseline, lp_reference_import, _, lp_p_ch, lp_p_dis = _run_reference_episode(
-            env, actors, n, battery_idx, device, lp_actions=lp_actions,
+            env, actor, n, battery_idx, one_hots, device, lp_actions=lp_actions,
         )
         print(f"LP baseline reward (reference day): {lp_baseline:.4f}")
 
@@ -392,25 +403,29 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
         ep_return = 0.0
 
         while env.agents:
-            # Battery-less agents always receive action=0 (no battery means no action)
+            # Battery-less agents always receive action=0
             actions_dict: dict[str, np.ndarray] = {
                 f"consumer_{i}": np.zeros(1, dtype=np.float32) for i in range(n) if env.E_max[i] == 0
             }
 
             _t = time.perf_counter()
-            for j, i in enumerate(battery_idx):
-                if total_steps < config.warmup_steps:
-                    a = env.action_space(f"consumer_{i}").sample()
-                else:
-                    obs_t = torch.as_tensor(obs[i], dtype=torch.float32, device=device).unsqueeze(0)
-                    with torch.no_grad():
-                        a_t, _, _ = actors[j].sample(obs_t)
-                    a = a_t.squeeze(0).cpu().numpy().astype(np.float32)
-                actions_dict[f"consumer_{i}"] = a
+            if total_steps < config.warmup_steps:
+                for i in battery_idx:
+                    actions_dict[f"consumer_{i}"] = env.action_space(f"consumer_{i}").sample()
+            else:
+                obs_batch = np.stack([
+                    np.concatenate([obs[battery_idx[j]], one_hots[j]]) for j in range(n_battery)
+                ])
+                obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    a_batch, _, _ = actor.sample(obs_t)
+                all_actions = a_batch.cpu().numpy()
+                for j, i in enumerate(battery_idx):
+                    actions_dict[f"consumer_{i}"] = all_actions[j]
             t_action += time.perf_counter() - _t
 
             _t = time.perf_counter()
-            next_obs_dict, rewards, terms, truncs, infos = env.step(actions_dict)
+            next_obs_dict, rewards, terms, _, _ = env.step(actions_dict)
             t_step += time.perf_counter() - _t
 
             done = any(terms.values())
@@ -419,43 +434,37 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             _t = time.perf_counter()
             next_obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
             for j, i in enumerate(battery_idx):
-                buffers[j].add(
-                    obs[i],
-                    actions_dict[f"consumer_{i}"],
-                    rewards[f"consumer_{i}"],
-                    next_obs[i],
-                    done,
-                )
+                aug_obs = np.concatenate([obs[i], one_hots[j]])
+                aug_next = np.concatenate([next_obs[i], one_hots[j]])
+                buffer.add(aug_obs, actions_dict[f"consumer_{i}"], rewards[f"consumer_{i}"], aug_next, done)
             t_buffer += time.perf_counter() - _t
 
             obs = next_obs
             total_steps += 1
 
             _t = time.perf_counter()
-            if total_steps > config.warmup_steps and buffers[0].size >= config.batch_size:
+            if total_steps > config.warmup_steps and buffer.size >= config.batch_size:
                 for _ in range(config.updates_per_step):
-                    for j in range(n_battery):
-                        _update_agent(
-                            actors[j], critics[j], target_critics[j],
-                            buffers[j], log_alphas[j],
-                            actor_optims[j], critic_optims[j], alpha_optims[j],
-                            config, target_entropy, device,
-                        )
+                    _update_agent(
+                        actor, critic, target_critic,
+                        buffer, log_alpha,
+                        actor_optim, critic_optim, alpha_optim,
+                        config, target_entropy, device,
+                    )
             t_update += time.perf_counter() - _t
 
         avg_return = ep_return / (n * config.horizon)
         episode_returns.append(avg_return)
-        alpha_values = [float(log_alpha.exp().detach().cpu()) for log_alpha in log_alphas]
-        alpha_mean = float(np.mean(alpha_values))
+        alpha_val = float(log_alpha.exp().detach().cpu())
         print(
             f"Episode {episode + 1:4d}/{config.episodes}: "
-            f"avg_return={avg_return:10.4f}  alpha={alpha_mean:8.4f}  steps={total_steps}"
+            f"avg_return={avg_return:10.4f}  alpha={alpha_val:8.4f}  steps={total_steps}"
         )
 
         if (episode + 1) % config.benchmark_interval == 0:
             _t = time.perf_counter()
             policy_reward, policy_import, policy_discharge_bonus, policy_p_ch, policy_p_dis = _run_reference_episode(
-                env, actors, n, battery_idx, device,
+                env, actor, n, battery_idx, one_hots, device,
             )
             t_benchmark += time.perf_counter() - _t
             benchmark_history.append(
@@ -625,7 +634,7 @@ def plot_benchmark_actions(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Independent SAC for decentralized energy-community MARL")
     parser.add_argument("--n-prosumers", type=int, default=14)
-    parser.add_argument("--episodes", type=int, default=500)
+    parser.add_argument("--episodes", type=int, default=2_000)
     parser.add_argument("--horizon", type=int, default=24)
     parser.add_argument("--capacity-bonus", type=float, default=10.0)
     parser.add_argument("--data-dir", type=str, default="Data")
@@ -639,7 +648,7 @@ def main() -> None:
     parser.add_argument("--no-randomize-scenarios", action="store_true",
                         help="Disable scenario randomization (use fixed Aug-2 data every episode)")
     parser.add_argument("--demand-noise-std", type=float, default=0.05)
-    parser.add_argument("--benchmark-interval", type=int, default=100)
+    parser.add_argument("--benchmark-interval", type=int, default=400)
     parser.add_argument("--alpha-grid", type=float, default=75.0,
                         help="Capacity violation penalty coefficient (default: 75.0, same as Julia model)")
     parser.add_argument("--violation-discharge-reward", type=float, default=15,

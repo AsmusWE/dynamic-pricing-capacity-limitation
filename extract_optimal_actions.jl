@@ -40,7 +40,12 @@ cap_ref = cap_setting(total_residual, 1, data["spot"])
 println("Computing individual benchmarks...")
 community_benchmark, individual_benchmark = benchmarks(ind_cost, ind_profile, tot_profile, cap_ref)
 
-println("Solving LP (beta=0.5, cap=1, Aug-2, with line capacities)...")
+# Set initial SoC to 0 (empty batteries at start)
+if haskey(data, "SoC_initial")
+    data["SoC_initial"] .= 0.0
+end
+
+println("Solving LP (beta=0.5, cap=1, Aug-2, with line capacities, initial SoC=0)...")
 sol = dynamic_pricing(data, node, line, individual_benchmark, 0.5, cap_ref, "none", true, GRB_ENV)
 
 if !has_values(sol)

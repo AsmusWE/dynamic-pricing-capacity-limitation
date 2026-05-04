@@ -155,17 +155,20 @@ class MARLEnvironment(ParallelEnv):
         if options.get("reference"):
             # Deterministic reference scenario for benchmarking
             self._apply_scenario(self._ref_spot, self._ref_PV, self._ref_D, self._ref_cap)
-            self.soc = (self.E_max * 0.5).astype(np.float32)
+            # OLD: self.soc = (self.E_max * 0.5).astype(np.float32)
         elif self._randomize:
             spot, PV, D = self._sample_scenario(seed)
             cap = self._compute_cap(D, PV, spot)
             self._apply_scenario(spot, PV, D, cap)
-            rng = np.random.default_rng(seed)
-            self.soc = (rng.uniform(0.0, 1.0, self._n) * self.E_max).astype(np.float32)
+            # OLD: rng = np.random.default_rng(seed)
+            # OLD: self.soc = (rng.uniform(0.0, 1.0, self._n) * self.E_max).astype(np.float32)
         else:
             self._apply_scenario(self._ref_spot, self._ref_PV, self._ref_D, self._ref_cap)
-            rng = np.random.default_rng(seed)
-            self.soc = (rng.uniform(0.0, 1.0, self._n) * self.E_max).astype(np.float32)
+            # OLD: rng = np.random.default_rng(seed)
+            # OLD: self.soc = (rng.uniform(0.0, 1.0, self._n) * self.E_max).astype(np.float32)
+
+        # Set initial SoC to 0 for all cases
+        self.soc = np.zeros(self._n, dtype=np.float32)
 
         observations = {f"consumer_{i}": self._get_obs(i) for i in range(self._n)}
         infos: dict[str, dict] = {agent: {} for agent in self.agents}
