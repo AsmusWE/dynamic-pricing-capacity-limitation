@@ -8,7 +8,7 @@
 #BSUB -q gpua100
 
 # Number of CPU cores
-#BSUB -n 2
+#BSUB -n 4
 
 # Request 1 GPU
 #BSUB -gpu "num=1"
@@ -24,6 +24,7 @@
 #BSUB -e marl_gpu_%J.err
 
 #BSUB -u aswin@dtu.dk
+#BSUB -R "span[hosts=1]"
 #=============== ENVIRONMENT ==================
 
 module purge
@@ -50,4 +51,4 @@ EOF
 
 #================= RUN CODE ===================
 
-python marl_main.py --wandb --episodes 10000 --warmup-steps 3000
+python marl_main.py --wandb --episodes 10000 --warmup-steps 3000 --buffer-size 10000 --batch-size 1024 --updates-per-step 2
