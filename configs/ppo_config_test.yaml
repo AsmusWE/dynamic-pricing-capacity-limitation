@@ -1,0 +1,20 @@
+# PPO test config — minimal, for CI / smoke tests
+defaults:
+  - datasets/data
+  - models/ppo_model
+  - experiments/ppo_exp
+  - _self_
+
+episodes: 5
+benchmark_interval: 5
+batch_size: 32
+randomize_scenarios: false
+use_wandb: false
+
+plot_path: Figures/test_ppo_returns.png
+benchmark_actions_path: Figures/test_ppo_benchmark_actions.png
+
+hydra:
+  run:
+    dir: .
+  output_subdir: .hydra

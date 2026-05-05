@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import dataclasses
 from dataclasses import dataclass
@@ -8,6 +7,8 @@ from pathlib import Path
 import time
 from typing import cast
 
+import hydra
+from omegaconf import DictConfig
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -162,6 +163,7 @@ class SACConfig:
     warmup_steps: int = 500
     updates_per_step: int = 1
     hidden_dim: int = 256
+    target_entropy_multiplier: float = 2.0
     seed: int = 42
     randomize_scenarios: bool = True
     demand_noise_std: float = 0.05
@@ -170,6 +172,7 @@ class SACConfig:
     violation_discharge_reward: float = 0.0
     use_wandb: bool = False
     wandb_project: str = "marl-energy"
+    wandb_run_name: str = ""  # empty → auto-generate from hyperparameters
 
 
 # ---------------------------------------------------------------------------
@@ -273,15 +276,16 @@ def _run_reference_episode(
     device: torch.device,
     *,
     lp_actions: np.ndarray | None = None,
-) -> tuple[float, np.ndarray, float, np.ndarray, np.ndarray]:
+) -> tuple[float, np.ndarray, float, np.ndarray, np.ndarray, float]:
     """Run one episode on the reference scenario using deterministic actions.
 
-    Returns: (total_reward, hourly_import, total_discharge_bonus, p_ch_per_hour, p_dis_per_hour)
+    Returns: (total_reward, hourly_import, total_discharge_bonus, p_ch_per_hour, p_dis_per_hour, total_violation)
     """
     obs_dict, _ = env.reset(options={"reference": True})
     obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
     total_reward = 0.0
     total_discharge_bonus = 0.0
+    total_violation = 0.0
     hourly_import: list[float] = []
     p_ch_sum: list[float] = []
     p_dis_sum: list[float] = []
@@ -309,6 +313,7 @@ def _run_reference_episode(
         p_ch_sum.append(float(sum(info["p_ch"] for info in infos.values())))
         p_dis_sum.append(float(sum(info["p_dis"] for info in infos.values())))
         viol = float(infos["consumer_0"]["capacity_violation"])
+        total_violation += viol
         if viol > 1e-4:
             total_discharge_bonus += env.violation_discharge_reward * sum(
                 infos[f"consumer_{i}"]["p_dis"] for i in range(n)
@@ -322,6 +327,7 @@ def _run_reference_episode(
         total_discharge_bonus,
         np.asarray(p_ch_sum, dtype=np.float32),
         np.asarray(p_dis_sum, dtype=np.float32),
+        total_violation,
     )
 
 
@@ -343,11 +349,12 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     if config.use_wandb:
         if wandb is None:
             raise RuntimeError("wandb is not installed. Run: pip install wandb")
-        run_name = (
+        auto_name = (
             f"ep{config.episodes}_bs{config.batch_size}_"
             f"bonus{config.capacity_bonus}_alpha{config.alpha_grid}_"
             f"vdr{config.violation_discharge_reward}_seed{config.seed}"
         )
+        run_name = config.wandb_run_name or auto_name
         wandb.init(
             project=config.wandb_project,
             name=run_name,
@@ -382,7 +389,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     # Network obs = env obs (146) + one-hot agent identity (n_battery)
     net_obs_dim = obs_dim + n_battery
 
-    target_entropy = -float(action_dim) * 2
+    target_entropy = -float(action_dim) * config.target_entropy_multiplier
 
     # Shared actor-critic: all battery agents use the same weights
     actor = Actor(net_obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
@@ -403,7 +410,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     lp_p_ch: np.ndarray | None = None
     lp_p_dis: np.ndarray | None = None
     if lp_actions is not None:
-        lp_baseline, lp_reference_import, _, lp_p_ch, lp_p_dis = _run_reference_episode(
+        lp_baseline, lp_reference_import, _, lp_p_ch, lp_p_dis, _ = _run_reference_episode(
             env, actor, n, battery_idx, one_hots, device, lp_actions=lp_actions,
         )
         print(f"LP baseline reward (reference day): {lp_baseline:.4f}")
@@ -423,6 +430,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
         obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
         t_obs += time.perf_counter() - _t
         ep_return = 0.0
+        ep_violation = 0.0
 
         while env.agents:
             # Battery-less agents always receive action=0
@@ -447,11 +455,12 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             t_action += time.perf_counter() - _t
 
             _t = time.perf_counter()
-            next_obs_dict, rewards, terms, _, _ = env.step(actions_dict)
+            next_obs_dict, rewards, terms, _, step_infos = env.step(actions_dict)
             t_step += time.perf_counter() - _t
 
             done = any(terms.values())
             ep_return += sum(rewards.values())
+            ep_violation += step_infos["consumer_0"]["capacity_violation"]
 
             _t = time.perf_counter()
             next_obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
@@ -483,11 +492,11 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             f"avg_return={avg_return:10.4f}  alpha={alpha_val:8.4f}  steps={total_steps}"
         )
         if config.use_wandb and wandb is not None:
-            wandb.log({"episode": episode + 1, "avg_return": avg_return, "alpha": alpha_val, "total_steps": total_steps})
+            wandb.log({"episode": episode + 1, "avg_return": avg_return, "alpha": alpha_val, "total_steps": total_steps, "capacity_violation": ep_violation})
 
         if (episode + 1) % config.benchmark_interval == 0:
             _t = time.perf_counter()
-            policy_reward, policy_import, policy_discharge_bonus, policy_p_ch, policy_p_dis = _run_reference_episode(
+            policy_reward, policy_import, policy_discharge_bonus, policy_p_ch, policy_p_dis, policy_violation = _run_reference_episode(
                 env, actor, n, battery_idx, one_hots, device,
             )
             t_benchmark += time.perf_counter() - _t
@@ -521,6 +530,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
                     "benchmark/total_import_kw": total_import,
                     "benchmark/p_ch_kw": float(policy_p_ch.sum()),
                     "benchmark/p_dis_kw": float(policy_p_dis.sum()),
+                    "benchmark/capacity_violation": policy_violation,
                 }
                 if lp_baseline is not None:
                     bm_log["benchmark/lp_reward"] = lp_baseline
@@ -670,58 +680,40 @@ def plot_benchmark_actions(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Independent SAC for decentralized energy-community MARL")
-    parser.add_argument("--n-prosumers", type=int, default=14)
-    parser.add_argument("--episodes", type=int, default=2_000)
-    parser.add_argument("--horizon", type=int, default=24)
-    parser.add_argument("--capacity-bonus", type=float, default=10.0)
-    parser.add_argument("--data-dir", type=str, default="Data")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--warmup-steps", type=int, default=5_000)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--buffer-size", type=int, default=5_000)
-    parser.add_argument("--updates-per-step", type=int, default=1)
-    parser.add_argument("--plot-path", type=str, default="Figures/independent_sac_returns.png")
-    parser.add_argument("--benchmark-actions-path", type=str, default="Figures/independent_sac_benchmark_actions.png")
-    parser.add_argument("--no-randomize-scenarios", action="store_true",
-                        help="Disable scenario randomization (use fixed Aug-2 data every episode)")
-    parser.add_argument("--demand-noise-std", type=float, default=0.05)
-    parser.add_argument("--benchmark-interval", type=int, default=400)
-    parser.add_argument("--alpha-grid", type=float, default=75.0,
-                        help="Capacity violation penalty coefficient (default: 75.0, same as Julia model)")
-    parser.add_argument("--violation-discharge-reward", type=float, default=15,
-                        help="Extra reward per kW discharged during a violation step (default: 0.0, disabled)")
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="marl-energy",
-                        help="W&B project name (default: marl-energy)")
-    args = parser.parse_args()
-
+@hydra.main(config_path="configs", config_name="config_prod", version_base=None)
+def main(cfg: DictConfig) -> None:
     config = SACConfig(
-        n_prosumers=args.n_prosumers,
-        episodes=args.episodes,
-        horizon=args.horizon,
-        capacity_bonus=args.capacity_bonus,
-        data_dir=args.data_dir,
-        seed=args.seed,
-        warmup_steps=args.warmup_steps,
-        batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
-        updates_per_step=args.updates_per_step,
-        randomize_scenarios=not args.no_randomize_scenarios,
-        demand_noise_std=args.demand_noise_std,
-        benchmark_interval=args.benchmark_interval,
-        alpha_grid=args.alpha_grid,
-        violation_discharge_reward=args.violation_discharge_reward,
-        use_wandb=args.wandb,
-        wandb_project=args.wandb_project,
+        n_prosumers=cfg.n_prosumers,
+        episodes=cfg.episodes,
+        horizon=cfg.horizon,
+        capacity_bonus=cfg.capacity_bonus,
+        data_dir=cfg.data_dir,
+        gamma=cfg.gamma,
+        tau=cfg.tau,
+        actor_lr=cfg.actor_lr,
+        critic_lr=cfg.critic_lr,
+        alpha_lr=cfg.alpha_lr,
+        batch_size=cfg.batch_size,
+        buffer_size=cfg.buffer_size,
+        warmup_steps=cfg.warmup_steps,
+        updates_per_step=cfg.updates_per_step,
+        hidden_dim=cfg.hidden_dim,
+        seed=cfg.seed,
+        randomize_scenarios=cfg.randomize_scenarios,
+        demand_noise_std=cfg.demand_noise_std,
+        benchmark_interval=cfg.benchmark_interval,
+        alpha_grid=cfg.alpha_grid,
+        violation_discharge_reward=cfg.violation_discharge_reward,
+        use_wandb=cfg.use_wandb,
+        wandb_project=cfg.wandb_project,
+        wandb_run_name=cfg.wandb_run_name,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)
     lp_baseline = benchmark_history[0].lp_reward if benchmark_history else None
-    plot_path = Path(args.plot_path)
+    plot_path = Path(cfg.plot_path)
     plot_returns(episode_returns, plot_path, benchmark_history=benchmark_history, lp_baseline=lp_baseline)
-    benchmark_actions_path = Path(args.benchmark_actions_path)
+    benchmark_actions_path = Path(cfg.benchmark_actions_path)
     plot_benchmark_actions(
         benchmark_history,
         benchmark_actions_path,

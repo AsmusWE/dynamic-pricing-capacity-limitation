@@ -1,0 +1,39 @@
+# Development config — fast iteration, small buffer, no W&B
+defaults:
+  - datasets/data
+  - models/model
+  - experiments/exp
+  - _self_
+
+# Fast overrides
+episodes: 4000 # Changed from default
+benchmark_interval: 800 # Changed from default
+warmup_steps: 1000 # Changed from default
+target_entropy_multiplier: 1
+actor_lr: 1e-4
+critic_lr: 1e-4
+alpha_lr: 1e-4
+batch_size: 256
+buffer_size: 10000 # Changed from default
+updates_per_step: 1
+hidden_dim: 256
+gamma: 0.999
+tau: 0.005
+seed: 42
+n_prosumers: 14
+horizon: 24
+capacity_bonus: 0.0
+data_dir: Data
+randomize_scenarios: true # Changed from default
+demand_noise_std: 0.05
+alpha_grid: 75.0
+violation_discharge_reward: 0.0
+use_wandb: true # Changed from default
+wandb_project: marl-energy
+plot_path: Figures/dev_sac_returns.png
+benchmark_actions_path: Figures/dev_sac_benchmark_actions.png
+
+hydra:
+  run:
+    dir: .
+  output_subdir: .hydra

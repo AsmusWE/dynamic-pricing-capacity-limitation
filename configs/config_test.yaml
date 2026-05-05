@@ -1,0 +1,23 @@
+# Test config — minimal run for CI / unit-test smoke checks
+defaults:
+  - datasets/data
+  - models/model
+  - experiments/exp
+  - _self_
+
+# Minimal overrides
+episodes: 5
+benchmark_interval: 5
+warmup_steps: 10
+buffer_size: 500
+batch_size: 32
+randomize_scenarios: false
+use_wandb: false
+
+plot_path: Figures/test_sac_returns.png
+benchmark_actions_path: Figures/test_sac_benchmark_actions.png
+
+hydra:
+  run:
+    dir: .
+  output_subdir: .hydra

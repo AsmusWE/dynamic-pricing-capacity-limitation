@@ -1,0 +1,17 @@
+# SAC model / network architecture hyperparameters
+hidden_dim: 256
+
+# RL discount and soft-update
+gamma: 0.999
+tau: 0.005
+
+# Learning rates
+actor_lr: 1.0e-3
+critic_lr: 1.0e-3
+alpha_lr: 5.0e-4
+
+# Replay buffer & update schedule
+batch_size: 256
+buffer_size: 100000
+warmup_steps: 500
+updates_per_step: 1

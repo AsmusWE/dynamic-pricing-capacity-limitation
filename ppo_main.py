@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 import time
 from typing import cast
+
+import hydra
+from omegaconf import DictConfig
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -212,6 +214,7 @@ class PPOConfig:
     violation_discharge_reward: float = 0.0
     use_wandb: bool = False
     wandb_project: str = "marl-energy"
+    wandb_run_name: str = ""  # empty → auto-generate from hyperparameters
 
 
 # ---------------------------------------------------------------------------
@@ -309,12 +312,13 @@ def _run_reference_episode(
     device: torch.device,
     *,
     lp_actions: np.ndarray | None = None,
-) -> tuple[float, np.ndarray, float, np.ndarray, np.ndarray]:
+) -> tuple[float, np.ndarray, float, np.ndarray, np.ndarray, float]:
     """Run one episode on the reference scenario using deterministic (or LP) actions."""
     obs_dict, _ = env.reset(options={"reference": True})
     obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
     total_reward = 0.0
     total_discharge_bonus = 0.0
+    total_violation = 0.0
     hourly_import: list[float] = []
     p_ch_sum: list[float] = []
     p_dis_sum: list[float] = []
@@ -345,6 +349,7 @@ def _run_reference_episode(
         p_ch_sum.append(float(sum(info["p_ch"] for info in infos.values())))
         p_dis_sum.append(float(sum(info["p_dis"] for info in infos.values())))
         viol = float(infos["consumer_0"]["capacity_violation"])
+        total_violation += viol
         if viol > 1e-4:
             total_discharge_bonus += env.violation_discharge_reward * sum(
                 infos[f"consumer_{i}"]["p_dis"] for i in range(n)
@@ -358,6 +363,7 @@ def _run_reference_episode(
         total_discharge_bonus,
         np.asarray(p_ch_sum, dtype=np.float32),
         np.asarray(p_dis_sum, dtype=np.float32),
+        total_violation,
     )
 
 
@@ -374,11 +380,12 @@ def train_ppo(config: PPOConfig) -> tuple[list[float], list[BenchmarkRollout], n
     if config.use_wandb:
         if wandb is None:
             raise RuntimeError("wandb is not installed. Run: pip install wandb")
-        run_name = (
+        auto_name = (
             f"ppo_ep{config.episodes}_bs{config.batch_size}_"
             f"bonus{config.capacity_bonus}_alpha{config.alpha_grid}_"
             f"seed{config.seed}"
         )
+        run_name = config.wandb_run_name or auto_name
         wandb.init(
             project=config.wandb_project,
             name=run_name,
@@ -422,7 +429,7 @@ def train_ppo(config: PPOConfig) -> tuple[list[float], list[BenchmarkRollout], n
     lp_p_ch: np.ndarray | None = None
     lp_p_dis: np.ndarray | None = None
     if lp_actions is not None:
-        lp_baseline, lp_reference_import, _, lp_p_ch, lp_p_dis = _run_reference_episode(
+        lp_baseline, lp_reference_import, _, lp_p_ch, lp_p_dis, _ = _run_reference_episode(
             env, actor, n, battery_idx, one_hots, device, lp_actions=lp_actions,
         )
         print(f"LP baseline reward (reference day): {lp_baseline:.4f}")
@@ -442,6 +449,7 @@ def train_ppo(config: PPOConfig) -> tuple[list[float], list[BenchmarkRollout], n
         obs = [obs_dict[f"consumer_{i}"] for i in range(n)]
         buffer = RolloutBuffer(config.horizon, n_battery, net_obs_dim, action_dim)
         ep_return = 0.0
+        ep_violation = 0.0
 
         step_idx = 0
         while env.agents:
@@ -465,11 +473,12 @@ def train_ppo(config: PPOConfig) -> tuple[list[float], list[BenchmarkRollout], n
                 actions_dict[f"consumer_{i}"] = all_actions[j]
 
             _t = time.perf_counter()
-            next_obs_dict, rewards, terms, _, _ = env.step(actions_dict)
+            next_obs_dict, rewards, terms, _, step_infos = env.step(actions_dict)
             t_step += time.perf_counter() - _t
 
             done = any(terms.values())
             ep_return += sum(rewards.values())
+            ep_violation += step_infos["consumer_0"]["capacity_violation"]
 
             # Store trajectory
             rewards_batch = np.array([rewards[f"consumer_{battery_idx[j]}"] for j in range(n_battery)])
@@ -519,11 +528,12 @@ def train_ppo(config: PPOConfig) -> tuple[list[float], list[BenchmarkRollout], n
                 "avg_return": avg_return,
                 "actor_loss": actor_loss,
                 "critic_loss": critic_loss,
+                "capacity_violation": ep_violation,
             })
 
         if (episode + 1) % config.benchmark_interval == 0:
             _t = time.perf_counter()
-            policy_reward, policy_import, policy_discharge_bonus, policy_p_ch, policy_p_dis = _run_reference_episode(
+            policy_reward, policy_import, policy_discharge_bonus, policy_p_ch, policy_p_dis, policy_violation = _run_reference_episode(
                 env, actor, n, battery_idx, one_hots, device,
             )
             t_benchmark += time.perf_counter() - _t
@@ -557,6 +567,7 @@ def train_ppo(config: PPOConfig) -> tuple[list[float], list[BenchmarkRollout], n
                     "benchmark/total_import_kw": total_import,
                     "benchmark/p_ch_kw": float(policy_p_ch.sum()),
                     "benchmark/p_dis_kw": float(policy_p_dis.sum()),
+                    "benchmark/capacity_violation": policy_violation,
                 }
                 if lp_baseline is not None:
                     bm_log["benchmark/lp_reward"] = lp_baseline
@@ -580,7 +591,7 @@ def train_ppo(config: PPOConfig) -> tuple[list[float], list[BenchmarkRollout], n
     if config.use_wandb and wandb is not None:
         wandb.finish()
 
-    return episode_returns, benchmark_history
+    return episode_returns, benchmark_history, ref_cap
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +628,7 @@ def plot_benchmark_actions(
     if not benchmark_history:
         return
 
-    n_panels = len(benchmark_history)
+    n_panels = len(benchmark_history) + 1  # +1 for LP optimal panel
     fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4), squeeze=False)
     x = np.arange(1, len(benchmark_history[0].policy_import) + 1)
 
@@ -630,6 +641,8 @@ def plot_benchmark_actions(
         if record.policy_p_dis is not None:
             lbl_dis = "Sum battery discharge" if idx == 0 else None
             ax.scatter(x, record.policy_p_dis, color="#D62728", marker='x', s=40, label=lbl_dis)
+        if record.lp_import is not None:
+            ax.plot(x, record.lp_import, color="#D1495B", linewidth=2.0, label="LP optimal")
         if capacity_line is not None:
             ax.plot(x, capacity_line, color="black", linestyle="--", linewidth=1.5, label="Capacity limit")
         ax.set_title(f"Benchmark ep {record.episode}")
@@ -637,6 +650,24 @@ def plot_benchmark_actions(
         ax.set_ylabel("Community import [kW]")
         ax.set_xlim(1, len(x))
         ax.grid(alpha=0.25)
+
+    ax_opt = axes[0, -1]
+    lp_import = benchmark_history[0].lp_import
+    if lp_import is not None:
+        ax_opt.bar(x, lp_import, width=0.9, color="#D1495B", label="LP optimal actions")
+        lp_p_ch = benchmark_history[0].lp_p_ch
+        lp_p_dis = benchmark_history[0].lp_p_dis
+        if lp_p_ch is not None:
+            ax_opt.scatter(x, lp_p_ch, color="#2CA02C", marker='o', s=30, label="LP sum battery charge")
+        if lp_p_dis is not None:
+            ax_opt.scatter(x, lp_p_dis, color="#D62728", marker='x', s=40, label="LP sum battery discharge")
+    if capacity_line is not None:
+        ax_opt.plot(x, capacity_line, color="black", linestyle="--", linewidth=1.5, label="Capacity limit")
+    ax_opt.set_title("LP optimal actions")
+    ax_opt.set_xlabel("Hour")
+    ax_opt.set_ylabel("Community import [kW]")
+    ax_opt.set_xlim(1, len(x))
+    ax_opt.grid(alpha=0.25)
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
     if handles:
@@ -652,60 +683,42 @@ def plot_benchmark_actions(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="PPO for decentralized energy-community MARL")
-    parser.add_argument("--n-prosumers", type=int, default=14)
-    parser.add_argument("--episodes", type=int, default=1_000)
-    parser.add_argument("--horizon", type=int, default=24)
-    parser.add_argument("--capacity-bonus", type=float, default=10.0)
-    parser.add_argument("--data-dir", type=str, default="Data")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--n-updates", type=int, default=5,
-                        help="Number of PPO update steps per episode")
-    parser.add_argument("--clip-ratio", type=float, default=0.2)
-    parser.add_argument("--entropy-coeff", type=float, default=0.001)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--plot-path", type=str, default="Figures/ppo_returns.png")
-    parser.add_argument("--benchmark-actions-path", type=str, default="Figures/ppo_benchmark_actions.png")
-    parser.add_argument("--no-randomize-scenarios", action="store_true")
-    parser.add_argument("--demand-noise-std", type=float, default=0.05)
-    parser.add_argument("--benchmark-interval", type=int, default=500)
-    parser.add_argument("--alpha-grid", type=float, default=75.0)
-    parser.add_argument("--violation-discharge-reward", type=float, default=0.0)
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="marl-energy")
-    args = parser.parse_args()
-
+@hydra.main(config_path="configs", config_name="ppo_config_prod", version_base=None)
+def main(cfg: DictConfig) -> None:
     config = PPOConfig(
-        n_prosumers=args.n_prosumers,
-        episodes=args.episodes,
-        horizon=args.horizon,
-        capacity_bonus=args.capacity_bonus,
-        data_dir=args.data_dir,
-        seed=args.seed,
-        batch_size=args.batch_size,
-        n_updates=args.n_updates,
-        clip_ratio=args.clip_ratio,
-        entropy_coeff=args.entropy_coeff,
-        gae_lambda=args.gae_lambda,
-        randomize_scenarios=not args.no_randomize_scenarios,
-        demand_noise_std=args.demand_noise_std,
-        benchmark_interval=args.benchmark_interval,
-        alpha_grid=args.alpha_grid,
-        violation_discharge_reward=args.violation_discharge_reward,
-        use_wandb=args.wandb,
-        wandb_project=args.wandb_project,
+        n_prosumers=cfg.n_prosumers,
+        episodes=cfg.episodes,
+        horizon=cfg.horizon,
+        capacity_bonus=cfg.capacity_bonus,
+        data_dir=cfg.data_dir,
+        gamma=cfg.gamma,
+        gae_lambda=cfg.gae_lambda,
+        actor_lr=cfg.actor_lr,
+        critic_lr=cfg.critic_lr,
+        batch_size=cfg.batch_size,
+        n_updates=cfg.n_updates,
+        clip_ratio=cfg.clip_ratio,
+        entropy_coeff=cfg.entropy_coeff,
+        hidden_dim=cfg.hidden_dim,
+        seed=cfg.seed,
+        randomize_scenarios=cfg.randomize_scenarios,
+        demand_noise_std=cfg.demand_noise_std,
+        benchmark_interval=cfg.benchmark_interval,
+        alpha_grid=cfg.alpha_grid,
+        violation_discharge_reward=cfg.violation_discharge_reward,
+        use_wandb=cfg.use_wandb,
+        wandb_project=cfg.wandb_project,
+        wandb_run_name=cfg.wandb_run_name,
     )
 
-    episode_returns, benchmark_history = train_ppo(config)
-    plot_path = Path(args.plot_path)
+    episode_returns, benchmark_history, ref_cap = train_ppo(config)
+    plot_path = Path(cfg.plot_path)
     plot_returns(episode_returns, plot_path)
-    benchmark_actions_path = Path(args.benchmark_actions_path)
+    benchmark_actions_path = Path(cfg.benchmark_actions_path)
     plot_benchmark_actions(
         benchmark_history,
         benchmark_actions_path,
-        capacity_line=benchmark_history[0].policy_import if benchmark_history else None,
+        capacity_line=ref_cap if benchmark_history else None,
     )
     print(f"Saved return plot to: {plot_path}")
     if benchmark_history:

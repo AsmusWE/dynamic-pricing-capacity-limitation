@@ -1,0 +1,11 @@
+# Production config — full training run with all defaults
+defaults:
+  - datasets/data
+  - models/model
+  - experiments/exp
+  - _self_
+
+hydra:
+  run:
+    dir: .          # keep working dir as project root so Data/ and Figures/ resolve correctly
+  output_subdir: .hydra

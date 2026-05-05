@@ -1,0 +1,16 @@
+# PPO model / network architecture hyperparameters
+hidden_dim: 256
+
+# RL discount and GAE
+gamma: 0.999
+gae_lambda: 0.95
+
+# Learning rates
+actor_lr: 1.0e-3
+critic_lr: 1.0e-3
+
+# PPO update schedule
+batch_size: 256
+n_updates: 10
+clip_ratio: 0.2
+entropy_coeff: 0.001
