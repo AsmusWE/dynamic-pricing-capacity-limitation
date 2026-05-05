@@ -5,6 +5,12 @@ defaults:
   - experiments/exp
   - _self_
 
+# Default values for all SAC configuration parameters
+target_entropy_multiplier: 2.0
+wandb_run_name: ""  # empty → auto-generate from hyperparameters
+plot_path: Figures/sac_returns.png
+benchmark_actions_path: Figures/sac_benchmark_actions.png
+
 hydra:
   run:
     dir: .          # keep working dir as project root so Data/ and Figures/ resolve correctly

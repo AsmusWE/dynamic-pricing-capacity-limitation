@@ -6,7 +6,7 @@
 
 #BSUB -q hpc
 #BSUB -n 1
-#BSUB -R "rusage[mem=4B]"
+#BSUB -R "rusage[mem=4GB]"
 #BSUB -W 03:00
 #BSUB -u aswin@dtu.dk
 #BSUB -o Output_%J_%I.out
@@ -76,6 +76,9 @@ OVERRIDES="${CONFIGS[$IDX]}"
 
 echo "Run name : $RUN_NAME"
 echo "Overrides: $OVERRIDES"
+
+cd $HOME/dynamic-pricing-capacity-limitation
+source venv/bin/activate
 
 python marl_main.py \
     --config-name config_dev \
