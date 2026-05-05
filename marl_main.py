@@ -496,7 +496,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             f"avg_return={avg_return:10.4f}  alpha={alpha_val:8.4f}  steps={total_steps}"
         )
         if config.use_wandb and wandb is not None:
-            wandb.log({"episode": episode + 1, "avg_return": avg_return, "alpha": alpha_val, "total_steps": total_steps, "capacity_violation": ep_violation})
+            wandb.log({"avg_return": avg_return, "alpha": alpha_val, "capacity_violation": ep_violation})
 
         if (episode + 1) % config.benchmark_interval == 0:
             _t = time.perf_counter()
@@ -529,7 +529,6 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             )
             if config.use_wandb and wandb is not None:
                 bm_log: dict = {
-                    "episode": episode + 1,
                     "benchmark/policy_reward": policy_reward,
                     "benchmark/total_import_kw": total_import,
                     "benchmark/p_ch_kw": float(policy_p_ch.sum()),
@@ -539,6 +538,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
                 if lp_baseline is not None:
                     bm_log["benchmark/lp_reward"] = lp_baseline
                     bm_log["benchmark/pct_of_lp"] = 100.0 * policy_reward / lp_baseline
+                    bm_log["benchmark/optimality_gap"] = lp_baseline - policy_reward
                 wandb.log(bm_log)
 
     total_t = t_reset + t_obs + t_action + t_step + t_buffer + t_update + t_benchmark
