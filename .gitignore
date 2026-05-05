@@ -9,3 +9,8 @@ job_marl.sh
 *.log
 *.sh
 *.sh
+*.out
+*.err
+__pycache__/
+*.pyc
+*.egg-info/
