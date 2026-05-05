@@ -173,6 +173,8 @@ class SACConfig:
     use_wandb: bool = False
     wandb_project: str = "marl-energy"
     wandb_run_name: str = ""  # empty → auto-generate from hyperparameters
+    plot_path: str = "Figures/sac_returns.png"
+    benchmark_actions_path: str = "Figures/sac_benchmark_actions.png"
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +700,7 @@ def main(cfg: DictConfig) -> None:
         warmup_steps=cfg.warmup_steps,
         updates_per_step=cfg.updates_per_step,
         hidden_dim=cfg.hidden_dim,
+        target_entropy_multiplier=cfg.target_entropy_multiplier,
         seed=cfg.seed,
         randomize_scenarios=cfg.randomize_scenarios,
         demand_noise_std=cfg.demand_noise_std,
@@ -707,6 +710,8 @@ def main(cfg: DictConfig) -> None:
         use_wandb=cfg.use_wandb,
         wandb_project=cfg.wandb_project,
         wandb_run_name=cfg.wandb_run_name,
+        plot_path=cfg.plot_path,
+        benchmark_actions_path=cfg.benchmark_actions_path,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)

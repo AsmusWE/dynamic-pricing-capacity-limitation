@@ -30,6 +30,7 @@ alpha_grid: 75.0
 violation_discharge_reward: 0.0
 use_wandb: true # Changed from default
 wandb_project: marl-energy
+wandb_run_name: ""  # empty → auto-generate from hyperparameters
 plot_path: Figures/dev_sac_returns.png
 benchmark_actions_path: Figures/dev_sac_benchmark_actions.png
 
