@@ -21,32 +21,32 @@
 
 RUN_NAMES=(
     "default"
-    "target_entropy_multiplier=0.5"
-    "hidden_dim=128"
-    "hidden_dim=512"
-    "tau=0.05"
-    "tau=0.001"
-    "actor_lr=1e-5 critic_lr=1e-5 alpha_lr=1e-5"
-    "actor_lr=5e-6 critic_lr=5e-6 alpha_lr=5e-6"
+    "entropy_0.5"
+    "hidden_128"
+    "hidden_512"
+    "tau_0.05"
+    "tau_0.001"
+    "lr_1e-5"
+    "lr_5e-6"
 )
 
 CONFIGS=(
-    # 1 - default
-    "plot_path=Figures/default_returns.png benchmark_actions_path=Figures/default_benchmark_actions.png"
-    # 2 - target_entropy_multiplier=0.5
-    "target_entropy_multiplier=0.5 plot_path=Figures/target_entropy_0.5_returns.png benchmark_actions_path=Figures/target_entropy_0.5_benchmark_actions.png"
-    # 3 - hidden_dim=128
-    "hidden_dim=128 plot_path=Figures/hidden_dim_128_returns.png benchmark_actions_path=Figures/hidden_dim_128_benchmark_actions.png"
-    # 4 - hidden_dim=512
-    "hidden_dim=512 plot_path=Figures/hidden_dim_512_returns.png benchmark_actions_path=Figures/hidden_dim_512_benchmark_actions.png"
-    # 5 - tau=0.05
-    "tau=0.05 plot_path=Figures/tau_0.05_returns.png benchmark_actions_path=Figures/tau_0.05_benchmark_actions.png"
-    # 6 - tau=0.001
-    "tau=0.001 plot_path=Figures/tau_0.001_returns.png benchmark_actions_path=Figures/tau_0.001_benchmark_actions.png"
-    # 7 - actor_lr=1e-5 critic_lr=1e-5 alpha_lr=1e-5
-    "actor_lr=1e-5 critic_lr=1e-5 alpha_lr=1e-5 plot_path=Figures/lr_1e-5_returns.png benchmark_actions_path=Figures/lr_1e-5_benchmark_actions.png"
-    # 8 - actor_lr=5e-6 critic_lr=5e-6 alpha_lr=5e-6
-    "actor_lr=5e-6 critic_lr=5e-6 alpha_lr=5e-6 plot_path=Figures/lr_5e-6_returns.png benchmark_actions_path=Figures/lr_5e-6_benchmark_actions.png"
+    # 1 - default (no overrides beyond what config_dev sets)
+    "episodes=8000"
+    # 2 - lower target entropy multiplier
+    "episodes=8000 target_entropy_multiplier=0.5"
+    # 3 - smaller network
+    "episodes=8000 hidden_dim=128"
+    # 4 - larger network
+    "episodes=8000 hidden_dim=512"
+    # 5 - faster target network updates
+    "episodes=8000 tau=0.05"
+    # 6 - slower target network updates
+    "episodes=8000 tau=0.001"
+    # 7 - low learning rates
+    "episodes=8000 actor_lr=1e-5 critic_lr=1e-5 alpha_lr=1e-5"
+    # 8 - very low learning rates
+    "episodes=8000 actor_lr=5e-6 critic_lr=5e-6 alpha_lr=5e-6"
 )
 
 #=======================================================
