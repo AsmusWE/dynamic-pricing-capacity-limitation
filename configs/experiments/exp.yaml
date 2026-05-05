@@ -1,0 +1,20 @@
+# Experiment-level settings: training schedule, reward shaping, logging, outputs
+episodes: 2000
+seed: 42
+
+# Reward shaping
+capacity_bonus: 10.0
+alpha_grid: 75.0              # capacity-violation penalty coefficient
+violation_discharge_reward: 0.0  # extra reward per kW discharged during a violation
+
+# Evaluation
+benchmark_interval: 400       # run reference-day evaluation every N episodes
+
+# Logging
+use_wandb: false
+wandb_project: marl-energy
+wandb_run_name: ""   # leave empty to auto-generate from hyperparameters
+
+# Output paths (relative to project root)
+plot_path: Figures/sac_returns.png
+benchmark_actions_path: Figures/sac_benchmark_actions.png

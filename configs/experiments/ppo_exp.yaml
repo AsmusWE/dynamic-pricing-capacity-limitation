@@ -1,0 +1,20 @@
+# PPO experiment-level settings
+episodes: 1000
+seed: 42
+
+# Reward shaping
+capacity_bonus: 10.0
+alpha_grid: 75.0
+violation_discharge_reward: 0.0
+
+# Evaluation
+benchmark_interval: 500
+
+# Logging
+use_wandb: false
+wandb_project: marl-energy
+wandb_run_name: ""   # leave empty to auto-generate from hyperparameters
+
+# Output paths (relative to project root)
+plot_path: Figures/ppo_returns.png
+benchmark_actions_path: Figures/ppo_benchmark_actions.png

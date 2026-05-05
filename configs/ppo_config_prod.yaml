@@ -1,0 +1,11 @@
+# PPO production config — full training run
+defaults:
+  - datasets/data
+  - models/ppo_model
+  - experiments/ppo_exp
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: .hydra

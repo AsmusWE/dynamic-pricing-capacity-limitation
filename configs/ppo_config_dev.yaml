@@ -1,0 +1,19 @@
+# PPO development config — fast iteration
+defaults:
+  - datasets/data
+  - models/ppo_model
+  - experiments/ppo_exp
+  - _self_
+
+episodes: 50
+benchmark_interval: 25
+randomize_scenarios: false
+use_wandb: false
+
+plot_path: Figures/dev_ppo_returns.png
+benchmark_actions_path: Figures/dev_ppo_benchmark_actions.png
+
+hydra:
+  run:
+    dir: .
+  output_subdir: .hydra

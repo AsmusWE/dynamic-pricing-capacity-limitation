@@ -1,0 +1,6 @@
+# Dataset / environment data settings
+data_dir: Data
+n_prosumers: 14
+horizon: 24            # hours per episode (T)
+randomize_scenarios: true
+demand_noise_std: 0.05  # Gaussian σ on hourly demand (kWh/h)

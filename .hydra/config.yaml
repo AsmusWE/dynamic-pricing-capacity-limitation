@@ -1,0 +1,54 @@
+datasets:
+  data_dir: Data
+  n_prosumers: 14
+  horizon: 24
+  randomize_scenarios: true
+  demand_noise_std: 0.05
+models:
+  hidden_dim: 256
+  gamma: 0.999
+  tau: 0.005
+  actor_lr: 0.001
+  critic_lr: 0.001
+  alpha_lr: 0.0005
+  batch_size: 256
+  buffer_size: 100000
+  warmup_steps: 500
+  updates_per_step: 1
+experiments:
+  episodes: 2000
+  seed: 42
+  capacity_bonus: 10.0
+  alpha_grid: 75.0
+  violation_discharge_reward: 0.0
+  benchmark_interval: 400
+  use_wandb: false
+  wandb_project: marl-energy
+  plot_path: Figures/sac_returns.png
+  benchmark_actions_path: Figures/sac_benchmark_actions.png
+episodes: 4000
+benchmark_interval: 400
+warmup_steps: 1000
+target_entropy_multiplier: 1
+actor_lr: 0.001
+critic_lr: 0.001
+alpha_lr: 0.0005
+batch_size: 256
+buffer_size: 10000
+updates_per_step: 1
+hidden_dim: 256
+gamma: 0.999
+tau: 0.005
+seed: 42
+n_prosumers: 14
+horizon: 24
+capacity_bonus: 5.0
+data_dir: Data
+randomize_scenarios: true
+demand_noise_std: 0.05
+alpha_grid: 75.0
+violation_discharge_reward: 0.0
+use_wandb: true
+wandb_project: marl-energy
+plot_path: Figures/dev_sac_returns.png
+benchmark_actions_path: Figures/dev_sac_benchmark_actions.png

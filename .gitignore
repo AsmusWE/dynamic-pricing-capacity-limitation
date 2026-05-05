@@ -4,3 +4,7 @@ Crowley et al. - 2025 - How can energy communities provide grid services A dynam
 /.wandb
 *.wandb
 /figures
+/wandb
+job_marl.sh
+*.log
+*.sh
