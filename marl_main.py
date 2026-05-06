@@ -177,11 +177,6 @@ class SACConfig:
     wandb_run_name: str = ""  # empty → auto-generate from hyperparameters
     plot_path: str = "Figures/sac_returns.png"
     benchmark_actions_path: str = "Figures/sac_benchmark_actions.png"
-    # Optimistic SAC (Zhang et al. 2026). When True, entropic-risk optimistic
-    # Bellman replaces α-entropy regularisation; α is not learned.
-    use_optimism: bool = False
-    optimism_beta: float = 1.0
-    optimism_v_samples: int = 16
 
 
 # ---------------------------------------------------------------------------
@@ -243,63 +238,6 @@ def _update_agent(
 
     with torch.no_grad():
         log_alpha.clamp_(-10.0, 2.0)
-
-    _soft_update(target_critic, critic, config.tau)
-
-
-def _update_agent_optimistic(
-    actor: Actor,
-    critic: Critic,
-    target_critic: Critic,
-    buffer: ReplayBuffer,
-    actor_optim: torch.optim.Optimizer,
-    critic_optim: torch.optim.Optimizer,
-    config: SACConfig,
-    device: torch.device,
-) -> None:
-    """Optimistic actor-critic update following Zhang et al. 2026.
-
-    Uses the entropic-risk optimistic value (KL-penalty dual):
-        V^π(s) = (1/β) log E_{a~π}[ exp(β · Q^π(s, a)) ]
-    which is the risk-seeking analogue of SAC's soft V. Adapted from the paper's
-    tabular Algorithms 1–2 to continuous-action deep RL by:
-      1. estimating V_opt via Monte Carlo over K policy samples + logsumexp;
-      2. driving the actor to maximise V_opt (reparameterised gradient through
-         the K samples implements the e^{βA}-weighted policy gradient of Thm 2);
-      3. dropping α entropy regularisation (the paper's KL penalty replaces it).
-    """
-    o, a, r, no, d = buffer.sample(config.batch_size, device)
-    beta = config.optimism_beta
-    K = int(config.optimism_v_samples)
-    log_K = float(np.log(K))
-
-    # Critic target: y = r + γ V_opt(s'),  V_opt(s') = (1/β)(logsumexp(βQ) − log K)
-    with torch.no_grad():
-        no_rep = no.unsqueeze(1).expand(-1, K, -1).reshape(-1, no.shape[-1])
-        next_a, _, _ = actor.sample(no_rep)
-        tq1, tq2 = target_critic(no_rep, next_a)
-        q_min = torch.min(tq1, tq2).view(-1, K)
-        target_v = (torch.logsumexp(beta * q_min, dim=1, keepdim=True) - log_K) / beta
-        target_q = r + (1.0 - d) * config.gamma * target_v
-
-    q1, q2 = critic(o, a)
-    critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
-    critic_optim.zero_grad()
-    critic_loss.backward()
-    critic_optim.step()
-
-    # Actor: maximise V_opt(s) at sampled states. Reparameterised samples make
-    # ∇θ V_opt(s) = E_{a~π_θ}[softmax(βQ)(a) · ∇θ Q(s, a_θ)], i.e. the e^{βA}
-    # weighting of Theorem 2 in the paper.
-    o_rep = o.unsqueeze(1).expand(-1, K, -1).reshape(-1, o.shape[-1])
-    a_pi, _, _ = actor.sample(o_rep)
-    q1_pi, q2_pi = critic(o_rep, a_pi)
-    q_pi = torch.min(q1_pi, q2_pi).view(-1, K)
-    v_opt = (torch.logsumexp(beta * q_pi, dim=1, keepdim=True) - log_K) / beta
-    actor_loss = -v_opt.mean()
-    actor_optim.zero_grad()
-    actor_loss.backward()
-    actor_optim.step()
 
     _soft_update(target_critic, critic, config.tau)
 
@@ -542,20 +480,12 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             _t = time.perf_counter()
             if total_steps > config.warmup_steps and buffer.size >= config.batch_size:
                 for _ in range(config.updates_per_step):
-                    if config.use_optimism:
-                        _update_agent_optimistic(
-                            actor, critic, target_critic,
-                            buffer,
-                            actor_optim, critic_optim,
-                            config, device,
-                        )
-                    else:
-                        _update_agent(
-                            actor, critic, target_critic,
-                            buffer, log_alpha,
-                            actor_optim, critic_optim, alpha_optim,
-                            config, target_entropy, device,
-                        )
+                    _update_agent(
+                        actor, critic, target_critic,
+                        buffer, log_alpha,
+                        actor_optim, critic_optim, alpha_optim,
+                        config, target_entropy, device,
+                    )
             t_update += time.perf_counter() - _t
 
         avg_return = ep_return / (n * config.horizon)
@@ -784,9 +714,6 @@ def main(cfg: DictConfig) -> None:
         wandb_run_name=cfg.wandb_run_name,
         plot_path=cfg.plot_path,
         benchmark_actions_path=cfg.benchmark_actions_path,
-        use_optimism=cfg.use_optimism,
-        optimism_beta=cfg.optimism_beta,
-        optimism_v_samples=cfg.optimism_v_samples,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)
