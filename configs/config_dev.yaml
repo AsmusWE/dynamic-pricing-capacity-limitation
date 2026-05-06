@@ -18,7 +18,7 @@ buffer_size: 10000 # Changed from default
 updates_per_step: 1
 hidden_dim: 256
 gamma: 0.999
-tau: 0.005
+tau: 0.01
 seed: 42
 n_prosumers: 14
 horizon: 24
@@ -28,6 +28,7 @@ randomize_scenarios: true # Changed from default
 demand_noise_std: 0.05
 alpha_grid: 75.0
 violation_discharge_reward: 0.0
+independent_networks: false
 use_wandb: true # Changed from default
 wandb_project: marl-energy
 wandb_run_name: ""  # empty → auto-generate from hyperparameters

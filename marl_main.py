@@ -177,6 +177,7 @@ class SACConfig:
     wandb_run_name: str = ""  # empty → auto-generate from hyperparameters
     plot_path: str = "Figures/sac_returns.png"
     benchmark_actions_path: str = "Figures/sac_benchmark_actions.png"
+    independent_networks: bool = False  # True → per-agent nets; False → shared net + one-hot
 
 
 # ---------------------------------------------------------------------------
@@ -273,10 +274,10 @@ def _load_lp_actions(data_dir: str) -> np.ndarray | None:
 
 def _run_reference_episode(
     env: MARLEnvironment,
-    actor: Actor,
+    actors: list[Actor],
     n: int,
     battery_idx: list[int],
-    one_hots: np.ndarray,
+    one_hots: np.ndarray | None,
     device: torch.device,
     *,
     lp_actions: np.ndarray | None = None,
@@ -301,13 +302,21 @@ def _run_reference_episode(
         if lp_actions is not None:
             for i in range(n):
                 actions_dict[f"consumer_{i}"] = np.array([lp_actions[i, t]], dtype=np.float32)
+        elif one_hots is None:
+            # Independent networks: each agent uses its own actor with plain obs.
+            for j, i in enumerate(battery_idx):
+                obs_t = torch.as_tensor(obs[i][None], dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    _, _, det_a = actors[j].sample(obs_t)
+                actions_dict[f"consumer_{i}"] = det_a.squeeze(0).cpu().numpy()
         else:
+            # Shared network: batch all agents through actors[0] with one-hot obs.
             obs_batch = np.stack([
                 np.concatenate([obs[battery_idx[j]], one_hots[j]]) for j in range(len(battery_idx))
             ])
             obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
             with torch.no_grad():
-                _, _, det_a = actor.sample(obs_t)
+                _, _, det_a = actors[0].sample(obs_t)
             all_actions = det_a.cpu().numpy()
             for j, i in enumerate(battery_idx):
                 actions_dict[f"consumer_{i}"] = all_actions[j]
@@ -384,28 +393,47 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     n_battery = len(battery_idx)
     print(f"Battery agents: {battery_idx}  ({n_battery}/{n} prosumers)")
 
-    # One-hot identity per battery agent (row j → identity for battery_idx[j])
-    one_hots = np.eye(n_battery, dtype=np.float32)
-
     action_dim = 1
     action_low = np.array([-1.0], dtype=np.float32)
     action_high = np.array([1.0], dtype=np.float32)
-    # Network obs = env obs (146) + one-hot agent identity (n_battery)
-    net_obs_dim = obs_dim + n_battery
-
     target_entropy = -float(action_dim) * config.target_entropy_multiplier
 
-    # Shared actor-critic: all battery agents use the same weights
-    actor = Actor(net_obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
-    critic = Critic(net_obs_dim, action_dim, config.hidden_dim).to(device)
-    target_critic = copy.deepcopy(critic)
-    log_alpha = torch.tensor(0.0, device=device, requires_grad=True)
-    actor_optim = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
-    critic_optim = torch.optim.Adam(critic.parameters(), lr=config.critic_lr)
-    alpha_optim = torch.optim.Adam([log_alpha], lr=config.alpha_lr)
-
-    # Single shared replay buffer (all agents' transitions mixed together)
-    buffer = ReplayBuffer(config.buffer_size, net_obs_dim, action_dim)
+    if config.independent_networks:
+        # Per-agent networks: each battery agent has its own actor, critic, and buffer.
+        # Plain env obs used (no one-hot identity needed).
+        one_hots: np.ndarray | None = None
+        net_obs_dim = obs_dim
+        actors = [Actor(net_obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device) for _ in range(n_battery)]
+        critics = [Critic(net_obs_dim, action_dim, config.hidden_dim).to(device) for _ in range(n_battery)]
+        target_critics = [copy.deepcopy(c) for c in critics]
+        log_alphas = [torch.tensor(0.0, device=device, requires_grad=True) for _ in range(n_battery)]
+        actor_optims = [torch.optim.Adam(a.parameters(), lr=config.actor_lr) for a in actors]
+        critic_optims = [torch.optim.Adam(c.parameters(), lr=config.critic_lr) for c in critics]
+        alpha_optims = [torch.optim.Adam([la], lr=config.alpha_lr) for la in log_alphas]
+        buffers = [ReplayBuffer(config.buffer_size, net_obs_dim, action_dim) for _ in range(n_battery)]
+        print(f"Mode: independent networks  ({n_battery} separate actor-critics, net_obs_dim={net_obs_dim})")
+    else:
+        # Shared network: single actor-critic, one-hot agent identity appended to obs.
+        one_hots = np.eye(n_battery, dtype=np.float32)
+        net_obs_dim = obs_dim + n_battery
+        actor = Actor(net_obs_dim, action_dim, action_low, action_high, config.hidden_dim).to(device)
+        critic = Critic(net_obs_dim, action_dim, config.hidden_dim).to(device)
+        target_critic = copy.deepcopy(critic)
+        log_alpha = torch.tensor(0.0, device=device, requires_grad=True)
+        actor_optim = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
+        critic_optim = torch.optim.Adam(critic.parameters(), lr=config.critic_lr)
+        alpha_optim = torch.optim.Adam([log_alpha], lr=config.alpha_lr)
+        buffer = ReplayBuffer(config.buffer_size, net_obs_dim, action_dim)
+        # Wrap into lists so loop code is symmetric.
+        actors = [actor]
+        critics = [critic]
+        target_critics = [target_critic]
+        log_alphas = [log_alpha]
+        actor_optims = [actor_optim]
+        critic_optims = [critic_optim]
+        alpha_optims = [alpha_optim]
+        buffers = [buffer]
+        print(f"Mode: shared network  (one-hot encoded, net_obs_dim={net_obs_dim})")
 
     # Load LP baseline (optional — requires running extract_optimal_actions.jl first)
     lp_actions = _load_lp_actions(config.data_dir)
@@ -415,7 +443,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
     lp_p_dis: np.ndarray | None = None
     if lp_actions is not None:
         lp_baseline, lp_reference_import, _, lp_p_ch, lp_p_dis, _ = _run_reference_episode(
-            env, actor, n, battery_idx, one_hots, device, lp_actions=lp_actions,
+            env, actors, n, battery_idx, one_hots, device, lp_actions=lp_actions,
         )
         print(f"LP baseline reward (reference day): {lp_baseline:.4f}")
 
@@ -446,13 +474,19 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
             if total_steps < config.warmup_steps:
                 for i in battery_idx:
                     actions_dict[f"consumer_{i}"] = env.action_space(f"consumer_{i}").sample()
+            elif config.independent_networks:
+                for j, i in enumerate(battery_idx):
+                    obs_t = torch.as_tensor(obs[i][None], dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        a, _, _ = actors[j].sample(obs_t)
+                    actions_dict[f"consumer_{i}"] = a.squeeze(0).cpu().numpy()
             else:
                 obs_batch = np.stack([
                     np.concatenate([obs[battery_idx[j]], one_hots[j]]) for j in range(n_battery)
                 ])
                 obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
                 with torch.no_grad():
-                    a_batch, _, _ = actor.sample(obs_t)
+                    a_batch, _, _ = actors[0].sample(obs_t)
                 all_actions = a_batch.cpu().numpy()
                 for j, i in enumerate(battery_idx):
                     actions_dict[f"consumer_{i}"] = all_actions[j]
@@ -468,29 +502,45 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
 
             _t = time.perf_counter()
             next_obs = [next_obs_dict[f"consumer_{i}"] for i in range(n)]
-            for j, i in enumerate(battery_idx):
-                aug_obs = np.concatenate([obs[i], one_hots[j]])
-                aug_next = np.concatenate([next_obs[i], one_hots[j]])
-                buffer.add(aug_obs, actions_dict[f"consumer_{i}"], rewards[f"consumer_{i}"], aug_next, done)
+            if config.independent_networks:
+                for j, i in enumerate(battery_idx):
+                    buffers[j].add(obs[i], actions_dict[f"consumer_{i}"], rewards[f"consumer_{i}"], next_obs[i], done)
+            else:
+                assert one_hots is not None
+                for j, i in enumerate(battery_idx):
+                    aug_obs = np.concatenate([obs[i], one_hots[j]])
+                    aug_next = np.concatenate([next_obs[i], one_hots[j]])
+                    buffers[0].add(aug_obs, actions_dict[f"consumer_{i}"], rewards[f"consumer_{i}"], aug_next, done)
             t_buffer += time.perf_counter() - _t
 
             obs = next_obs
             total_steps += 1
 
             _t = time.perf_counter()
-            if total_steps > config.warmup_steps and buffer.size >= config.batch_size:
-                for _ in range(config.updates_per_step):
-                    _update_agent(
-                        actor, critic, target_critic,
-                        buffer, log_alpha,
-                        actor_optim, critic_optim, alpha_optim,
-                        config, target_entropy, device,
-                    )
+            if total_steps > config.warmup_steps and buffers[0].size >= config.batch_size:
+                if config.independent_networks:
+                    for j in range(n_battery):
+                        if buffers[j].size >= config.batch_size:
+                            for _ in range(config.updates_per_step):
+                                _update_agent(
+                                    actors[j], critics[j], target_critics[j],
+                                    buffers[j], log_alphas[j],
+                                    actor_optims[j], critic_optims[j], alpha_optims[j],
+                                    config, target_entropy, device,
+                                )
+                else:
+                    for _ in range(config.updates_per_step):
+                        _update_agent(
+                            actors[0], critics[0], target_critics[0],
+                            buffers[0], log_alphas[0],
+                            actor_optims[0], critic_optims[0], alpha_optims[0],
+                            config, target_entropy, device,
+                        )
             t_update += time.perf_counter() - _t
 
         avg_return = ep_return / (n * config.horizon)
         episode_returns.append(avg_return)
-        alpha_val = float(log_alpha.exp().detach().cpu())
+        alpha_val = float(sum(la.exp().detach().cpu() for la in log_alphas) / len(log_alphas))
         print(
             f"Episode {episode + 1:4d}/{config.episodes}: "
             f"avg_return={avg_return:10.4f}  alpha={alpha_val:8.4f}  steps={total_steps}"
@@ -501,7 +551,7 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
         if (episode + 1) % config.benchmark_interval == 0:
             _t = time.perf_counter()
             policy_reward, policy_import, policy_discharge_bonus, policy_p_ch, policy_p_dis, policy_violation = _run_reference_episode(
-                env, actor, n, battery_idx, one_hots, device,
+                env, actors, n, battery_idx, one_hots, device,
             )
             t_benchmark += time.perf_counter() - _t
             benchmark_history.append(
@@ -714,6 +764,7 @@ def main(cfg: DictConfig) -> None:
         wandb_run_name=cfg.wandb_run_name,
         plot_path=cfg.plot_path,
         benchmark_actions_path=cfg.benchmark_actions_path,
+        independent_networks=cfg.independent_networks,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)

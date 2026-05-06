@@ -7,6 +7,7 @@ defaults:
 
 # Default values for all SAC configuration parameters
 target_entropy_multiplier: 2.0
+independent_networks: false
 wandb_run_name: ""  # empty → auto-generate from hyperparameters
 plot_path: Figures/sac_returns.png
 benchmark_actions_path: Figures/sac_benchmark_actions.png
