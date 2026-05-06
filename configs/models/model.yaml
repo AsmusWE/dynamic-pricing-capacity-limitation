@@ -15,3 +15,11 @@ batch_size: 256
 buffer_size: 100000
 warmup_steps: 500
 updates_per_step: 1
+
+# Optimistic SAC (Zhang et al. 2026, "Optimism as Risk-Seeking in MARL").
+# When enabled, replaces SAC's entropy-regularised Bellman target with the
+# entropic-risk optimistic value V(s) = (1/β) log E_a[exp(β Q(s, a))].
+# Disables the α entropy temperature.
+use_optimism: false
+optimism_beta: 1.0       # risk-seeking coefficient β > 0; larger = more optimistic
+optimism_v_samples: 16   # K samples to estimate V_opt via logsumexp
