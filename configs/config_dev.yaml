@@ -28,9 +28,6 @@ randomize_scenarios: true # Changed from default
 demand_noise_std: 0.05
 alpha_grid: 75.0
 violation_discharge_reward: 0.0
-use_optimism: false
-optimism_beta: 1.0
-optimism_v_samples: 16
 use_wandb: true # Changed from default
 wandb_project: marl-energy
 wandb_run_name: ""  # empty → auto-generate from hyperparameters
