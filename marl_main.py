@@ -180,6 +180,7 @@ class SACConfig:
     plot_path: str = "Figures/sac_returns.png"
     benchmark_actions_path: str = "Figures/sac_benchmark_actions.png"
     independent_networks: bool = False  # True → per-agent nets; False → shared net + one-hot
+    obs_lookahead: int = 24  # hours of forecast in observation; episode length is always horizon
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +387,10 @@ def train_independent_sac(config: SACConfig) -> tuple[list[float], list[Benchmar
         scenario_seed=config.seed,
         alpha_grid=config.alpha_grid,
         violation_discharge_reward=config.violation_discharge_reward,
+        obs_lookahead=config.obs_lookahead,
     )
     n = env._n
-    obs_dim = 6 * config.horizon + 2  # 146 for T=24
+    obs_dim = 6 * config.obs_lookahead + 2
 
     # Only agents with a battery have meaningful actions; skip the rest entirely.
     battery_idx: list[int] = [i for i in range(n) if env.E_max[i] > 0]
@@ -767,6 +769,7 @@ def main(cfg: DictConfig) -> None:
         plot_path=cfg.plot_path,
         benchmark_actions_path=cfg.benchmark_actions_path,
         independent_networks=cfg.independent_networks,
+        obs_lookahead=cfg.obs_lookahead,
     )
 
     episode_returns, benchmark_history = train_independent_sac(config)

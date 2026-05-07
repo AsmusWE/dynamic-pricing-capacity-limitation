@@ -47,10 +47,12 @@ class MARLEnvironment(ParallelEnv):
         scenario_seed: int = 0,
         alpha_grid: float | None = None,
         violation_discharge_reward: float = 0.0,
+        obs_lookahead: int | None = None,
     ):
         super().__init__()
         self._n = int(n_prosumers)
         self.T = int(T)
+        self._obs_lookahead: int = int(obs_lookahead) if obs_lookahead is not None else self.T
         self.capacity_bonus = float(capacity_bonus)
         self._randomize = randomize_scenarios
         self._demand_noise_std = float(demand_noise_std)
@@ -117,7 +119,7 @@ class MARLEnvironment(ParallelEnv):
 
         # --- Fixed spaces ---
         self._obs_space = spaces.Box(
-            low=0.0, high=1.0, shape=(6 * self.T + 2,), dtype=np.float32
+            low=0.0, high=1.0, shape=(6 * self._obs_lookahead + 2,), dtype=np.float32
         )
         self._act_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
@@ -338,23 +340,23 @@ class MARLEnvironment(ParallelEnv):
         return spot, PV, D
 
     def _get_obs(self, i: int) -> np.ndarray:
-        """Build observation for agent i with remaining-day features padded to full length.
-        
-        Structure: [spot_remaining(T), cap_remaining(T), y_im_remaining(T), y_ex_remaining(T),
-                    soc(1), D_remaining(T), PV_remaining(T), hours_left(1)]
-        
-        Each "remaining" component starts at current hour self.t and is padded with 0's
-        to maintain constant length T.
+        """Build observation for agent i.
+
+        Structure: [spot(L), cap(L), y_im(L), y_ex(L), soc(1), D(L), PV(L), hours_left(1)]
+
+        L = obs_lookahead. Each signal shows the next L hours from the current step,
+        zero-padded if fewer than L hours remain in the episode.
+        hours_left is always relative to the full episode length T.
         """
         norm_soc = self.soc[i] / self.E_max[i] if self.E_max[i] > 0 else 0.0
         hours_left = self.T - self.t
-        
-        # Create padded views of remaining features (from current hour t to end of day)
+        L = self._obs_lookahead
+
+        # Slice the next L hours of each signal, zero-pad if near end of episode.
         def pad_remaining(signal, norm_const):
-            remaining = signal[self.t:]
-            padded = np.zeros(self.T, dtype=np.float32)
-            n_remaining = len(remaining)
-            padded[:n_remaining] = remaining / norm_const
+            remaining = signal[self.t : self.t + L]
+            padded = np.zeros(L, dtype=np.float32)
+            padded[:len(remaining)] = remaining / norm_const
             return padded
         
         spot_remaining = pad_remaining(self.spot, self._norm_spot)
