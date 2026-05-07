@@ -246,7 +246,7 @@ class MARLEnvironment(ParallelEnv):
 
         if done:
             observations = {
-                f"consumer_{i}": np.zeros(6 * self.T + 2, dtype=np.float32)
+                f"consumer_{i}": np.zeros(6 * self._obs_lookahead + 2, dtype=np.float32)
                 for i in range(self._n)
             }
         else:
